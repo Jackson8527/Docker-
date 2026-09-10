@@ -1,84 +1,185 @@
 <template>
   <div>
-    <el-card>
-      <template #header>
-        <div class="card-header">
-          <span>卷</span>
-          <div>
-            <el-button type="primary" @click="showCreate = true">创建卷</el-button>
-            <el-button @click="refresh">刷新</el-button>
-          </div>
-        </div>
-      </template>
-      <el-table :data="list" v-loading="loading">
-        <el-table-column prop="name" label="名称" />
-        <el-table-column prop="driver" label="驱动" />
-        <el-table-column prop="mountpoint" label="挂载点" />
-        <el-table-column label="操作" width="120">
+    <div class="dm-page-head">
+      <div>
+        <h2 class="dm-page-title">
+          卷
+          <span class="dm-page-count">{{ rows.length }} 个</span>
+        </h2>
+      </div>
+      <div class="dm-toolbar">
+        <el-input
+          v-model="keyword"
+          placeholder="搜索名称"
+          :prefix-icon="Search"
+          clearable
+          style="width: 180px"
+        />
+        <el-button type="primary" :icon="Plus" @click="openCreate">创建卷</el-button>
+        <el-button :icon="Refresh" :loading="loading" @click="load">刷新</el-button>
+      </div>
+    </div>
+
+    <div class="dm-panel">
+      <el-table v-loading="loading" :data="filtered" style="width: 100%">
+        <el-table-column label="名称" min-width="240">
           <template #default="{ row }">
-            <el-button size="small" type="danger" @click="removeRow(row)">删除</el-button>
+            <span class="v-name">{{ row.name }}</span>
           </template>
         </el-table-column>
-      </el-table>
-    </el-card>
 
-    <el-dialog v-model="showCreate" title="创建卷" width="400px">
-      <el-form>
-        <el-form-item label="名称"><el-input v-model="volName" /></el-form-item>
+        <el-table-column label="驱动" width="120">
+          <template #default="{ row }">
+            <el-tag size="small" effect="plain">{{ row.driver }}</el-tag>
+          </template>
+        </el-table-column>
+
+        <el-table-column label="挂载点" min-width="300">
+          <template #default="{ row }">
+            <el-tooltip :content="row.mountpoint" placement="top" :show-after="400">
+              <span class="dm-mono v-mount">{{ row.mountpoint }}</span>
+            </el-tooltip>
+          </template>
+        </el-table-column>
+
+        <el-table-column label="操作" width="150" align="right" fixed="right">
+          <template #default="{ row }">
+            <div class="dm-row-actions">
+              <el-button size="small" plain :icon="CopyDocument" @click="copyPath(row.mountpoint)">
+                复制路径
+              </el-button>
+              <el-button size="small" type="danger" plain :icon="Delete" @click="removeRow(row)">
+                删除
+              </el-button>
+            </div>
+          </template>
+        </el-table-column>
+
+        <template #empty>
+          <div class="v-empty">暂无数据卷</div>
+        </template>
+      </el-table>
+    </div>
+
+    <el-dialog v-model="showCreate" title="创建数据卷" width="420px">
+      <el-form label-width="72px">
+        <el-form-item label="名称">
+          <el-input v-model="volName" placeholder="例如 app-data" @keyup.enter="create" />
+        </el-form-item>
       </el-form>
       <template #footer>
         <el-button @click="showCreate = false">取消</el-button>
-        <el-button type="primary" @click="createVol">创建</el-button>
+        <el-button type="primary" :loading="creating" @click="create">创建</el-button>
       </template>
     </el-dialog>
   </div>
 </template>
 
 <script setup lang="ts">
-import { ref, onMounted } from 'vue'
+import { ref, computed, onMounted } from 'vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
-import { volumesApi } from '../api'
+import { Search, Refresh, Plus, Delete, CopyDocument } from '@element-plus/icons-vue'
+import { volumesApi, type VolumeRow } from '../api'
 
-const list = ref<any[]>([])
+const rows = ref<VolumeRow[]>([])
 const loading = ref(false)
+const creating = ref(false)
+const keyword = ref('')
 const showCreate = ref(false)
 const volName = ref('')
 
-async function refresh() {
+const filtered = computed(() => {
+  const k = keyword.value.trim().toLowerCase()
+  if (!k) return rows.value
+  return rows.value.filter((r) => r.name.toLowerCase().includes(k))
+})
+
+function fail(err: unknown) {
+  const e = err as { response?: { data?: { detail?: string } } }
+  ElMessage.error(e.response?.data?.detail || String(err))
+}
+
+async function load() {
   loading.value = true
   try {
     const r = await volumesApi.list()
-    list.value = r.data
-  } catch (err: any) {
-    ElMessage.error(err.response?.data?.detail || String(err))
+    rows.value = r.data
+  } catch (err) {
+    fail(err)
   } finally {
     loading.value = false
   }
 }
 
-async function createVol() {
-  if (!volName.value) return
+function openCreate() {
+  volName.value = ''
+  showCreate.value = true
+}
+
+async function create() {
+  const name = volName.value.trim()
+  if (!name) {
+    ElMessage.warning('请输入卷名称')
+    return
+  }
+  creating.value = true
   try {
-    await volumesApi.create(volName.value)
-    ElMessage.success('已创建')
+    await volumesApi.create(name)
+    ElMessage.success(`已创建卷 ${name}`)
     showCreate.value = false
-    volName.value = ''
-    refresh()
-  } catch (err: any) {
-    ElMessage.error(err.response?.data?.detail || String(err))
+    load()
+  } catch (err) {
+    fail(err)
+  } finally {
+    creating.value = false
   }
 }
 
-async function removeRow(row: any) {
+async function copyPath(path: string) {
   try {
-    await ElMessageBox.confirm(`确认删除卷 ${row.name}？`, '删除确认', { type: 'warning' })
+    await navigator.clipboard.writeText(path)
+    ElMessage.success('路径已复制')
+  } catch {
+    ElMessage.warning('浏览器不允许访问剪贴板')
+  }
+}
+
+async function removeRow(row: VolumeRow) {
+  try {
+    await ElMessageBox.confirm(
+      `确认删除卷「${row.name}」？卷中数据将一并丢失。`,
+      '删除确认',
+      { type: 'warning', confirmButtonText: '删除', cancelButtonText: '取消' }
+    )
     await volumesApi.remove(row.name)
     ElMessage.success('已删除')
-    refresh()
-  } catch (err: any) {
-    if (err !== 'cancel') ElMessage.error(err.response?.data?.detail || String(err))
+    load()
+  } catch (err) {
+    if (err !== 'cancel') fail(err)
   }
 }
 
-onMounted(refresh)
+onMounted(load)
 </script>
+
+<style scoped>
+.v-name {
+  font-weight: 600;
+  color: var(--dm-text);
+}
+
+.v-mount {
+  display: inline-block;
+  max-width: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  vertical-align: middle;
+}
+
+.v-empty {
+  padding: 34px 0;
+  color: var(--dm-text-muted);
+  font-size: 13px;
+}
+</style>

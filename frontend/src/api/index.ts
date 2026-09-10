@@ -10,6 +10,25 @@ export interface ContainerRow {
   created: string
 }
 
+export interface ImageRow {
+  id: string
+  tags: string[] | null
+  digest?: string
+}
+
+export interface NetworkRow {
+  id: string
+  name: string
+  driver: string
+  scope: string
+}
+
+export interface VolumeRow {
+  name: string
+  driver: string
+  mountpoint: string
+}
+
 const http = axios.create({ baseURL: '/api', timeout: 30000 })
 
 export const containersApi = {
