@@ -1,6 +1,7 @@
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect
 from starlette.websockets import WebSocketState
 import asyncio
+import json
 import logging
 import socket
 import threading
@@ -17,6 +18,15 @@ def _find_container(name: str):
         if c.name.startswith(name):
             return c
     return None
+
+
+def _raw_socket(output):
+    """docker-py may hand back a SocketIO wrapper or a bare socket.
+
+    The wrapper exposes `_sock` and HAS NO settimeout()/setblocking(), so all
+    socket-level calls must go through the underlying real socket.
+    """
+    return getattr(output, "_sock", output)
 
 
 def _send_from_thread(loop, ws: WebSocket, text: str) -> None:
@@ -115,34 +125,56 @@ async def ws_logs(ws: WebSocket, filter: str = "", stream: str = "stdout", tail:
 
 
 @router.websocket("/ws/exec")
-async def ws_exec(ws: WebSocket, container: str):
-    """Interactive terminal: docker exec tty, bidirectional over websocket."""
+async def ws_exec(ws: WebSocket, container: str, cmd: str = "/bin/sh"):
+    """Interactive terminal over websocket.
+
+    Client -> server frames are JSON control messages:
+        {"type": "input",  "data": "<keystrokes>"}
+        {"type": "resize", "cols": 120, "rows": 30}
+    (Plain text frames are still accepted as raw input for compatibility.)
+
+    Server -> client frames are raw terminal bytes.
+
+    The exec is created through the low-level API rather than
+    `containers.exec_run()` so the exec id stays available: without it we
+    could not resize the PTY, and an 80x24 PTY inside a wider browser
+    terminal wraps every line at the wrong column.
+    """
     await ws.accept()
-    sock = None
+    raw = None
     stop = threading.Event()
     reader = None
+    api = None
+    exec_id = None
     try:
-        cont = await asyncio.to_thread(get_docker_client().containers.get, container)
-        # stdin=True is REQUIRED: docker-py defaults it to False, which makes the
-        # daemon create the exec with AttachStdin=False, so everything written
-        # to the socket is silently discarded (read-only "terminal").
-        exec_inst = await asyncio.to_thread(
-            cont.exec_run, ["sh"], stdin=True, tty=True, socket=True, stream=True
+        client = get_docker_client()
+        api = client.api
+        cont = await asyncio.to_thread(client.containers.get, container)
+
+        spec = await asyncio.to_thread(
+            api.exec_create,
+            cont.id,
+            [cmd],
+            stdin=True,   # REQUIRED: without it the daemon discards all input
+            tty=True,
+            stdout=True,
+            stderr=True,
         )
-        sock = exec_inst.output
+        exec_id = spec["Id"]
+        output = await asyncio.to_thread(api.exec_start, exec_id, tty=True, socket=True)
+        raw = _raw_socket(output)
+        raw.setblocking(True)
+        # Short timeout so the reader thread stays interruptible on shutdown.
+        raw.settimeout(0.2)
 
         loop = asyncio.get_event_loop()
-        sock._sock.setblocking(True)
-        # NOTE: docker-py returns a SocketIO wrapper that has NO settimeout();
-        # the timeout must be set on the underlying real socket.
-        sock._sock.settimeout(0.2)
 
-        # Background thread: read bytes from the docker socket -> websocket.
+        # Background thread: docker socket -> websocket.
         def read_sock():
             try:
                 while not stop.is_set():
                     try:
-                        data = sock._sock.recv(4096)
+                        data = raw.recv(4096)
                     except socket.timeout:
                         continue
                     except OSError:
@@ -156,15 +188,33 @@ async def ws_exec(ws: WebSocket, container: str):
         reader = threading.Thread(target=read_sock, daemon=True)
         reader.start()
 
-        # Main coroutine: receive from websocket -> write into the docker socket.
+        # Main coroutine: websocket -> docker socket.
         while True:
-            data = await ws.receive_text()
-            if sock is None:
-                break
+            message = await ws.receive_text()
             try:
-                sock._sock.send(data.encode())
-            except OSError:
-                break
+                payload = json.loads(message)
+            except (ValueError, TypeError):
+                payload = None
+
+            if not isinstance(payload, dict):
+                # Legacy raw-text frame: treat the whole frame as input.
+                raw.send(message.encode())
+                continue
+
+            mtype = payload.get("type")
+            if mtype == "input":
+                raw.send(str(payload.get("data", "")).encode())
+            elif mtype == "resize":
+                cols = int(payload.get("cols") or 0)
+                rows = int(payload.get("rows") or 0)
+                if cols > 0 and rows > 0:
+                    try:
+                        await asyncio.to_thread(
+                            api.exec_resize, exec_id, height=rows, width=cols
+                        )
+                    except Exception:
+                        # A failed resize must never kill the session.
+                        logger.debug("exec_resize failed", exc_info=True)
     except WebSocketDisconnect:
         pass
     except Exception:
@@ -173,9 +223,9 @@ async def ws_exec(ws: WebSocket, container: str):
         stop.set()
         if reader is not None:
             reader.join(timeout=1)
-        if sock is not None:
+        if raw is not None:
             try:
-                sock.close()
+                raw.close()
             except Exception:
                 pass
         await _close_ws(ws)

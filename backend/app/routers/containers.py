@@ -5,6 +5,27 @@ from app.services.docker import get_docker_client, extract_error, ContainerInfo
 router = APIRouter(prefix="/api/containers", tags=["containers"])
 
 
+def _format_ports(ports) -> str:
+    """Render docker-py's ports mapping as human-readable text.
+
+    docker-py gives {'80/tcp': [{'HostIp': '127.0.0.1', 'HostPort': '8088'}]};
+    the UI wants '8088->80/tcp'. Exposed-only ports keep their bare form.
+    """
+    if not ports:
+        return ""
+    parts = []
+    for container_port, bindings in ports.items():
+        if not bindings:
+            parts.append(str(container_port))
+            continue
+        for b in bindings:
+            host_ip = (b or {}).get("HostIp") or ""
+            host_port = (b or {}).get("HostPort") or ""
+            prefix = f"{host_ip}:" if host_ip and host_ip not in ("0.0.0.0", "::") else ""
+            parts.append(f"{prefix}{host_port}->{container_port}")
+    return ", ".join(parts)
+
+
 def _info(cont) -> ContainerInfo:
     """Map a docker-py Container to our API model.
 
@@ -20,7 +41,7 @@ def _info(cont) -> ContainerInfo:
         image=tags[0] if tags else "",
         state=state_obj.get("Status", "") or cont.status,
         status=cont.status,
-        ports=str(cont.ports or []),
+        ports=_format_ports(cont.ports),
         created=cont.attrs.get("Created", ""),
     )
 

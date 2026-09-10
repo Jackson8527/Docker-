@@ -54,6 +54,12 @@ def test_containers():
         ok = st == 200 and isinstance(data, list) and len(data) > 0
         names = [c["name"] for c in data][:4]
         record("HTTP /api/containers", ok, f"{len(data)} containers e.g. {names}")
+
+        # Ports must be rendered for humans, not dumped as a dict repr.
+        with_ports = [c for c in data if c.get("ports")]
+        raw = [c for c in with_ports if "{" in c["ports"] or "'" in c["ports"]]
+        record("Container ports are human-readable", not raw,
+               (with_ports[0]["ports"] if with_ports else "no published ports"))
         return data
     except Exception as e:
         record("HTTP /api/containers", False, repr(e))
@@ -219,8 +225,11 @@ async def test_ws_exec(cid):
         url = f"{WS_BASE}/ws/exec?container={cid}"
         async with websockets.connect(url, open_timeout=15) as ws:
             await asyncio.sleep(0.5)
+            # Announce the terminal size first, exactly like the browser does.
+            await ws.send(json.dumps({"type": "resize", "cols": 100, "rows": 30}))
+            await asyncio.sleep(0.3)
             token = "EXECOK" + uuid.uuid4().hex[:6]
-            await ws.send(f"echo {token}\n")
+            await ws.send(json.dumps({"type": "input", "data": f"echo {token}\n"}))
             collected = ""
             deadline = asyncio.get_event_loop().time() + 15
             while asyncio.get_event_loop().time() < deadline:
@@ -236,6 +245,34 @@ async def test_ws_exec(cid):
                    f"echo roundtrip={'yes' if ok else 'no'}")
     except Exception as e:
         record("WS /ws/exec (interactive terminal)", False, repr(e))
+
+
+async def test_ws_exec_resize(cid):
+    """The PTY must accept a resize; an 80x24 PTY garbles a wide terminal."""
+    import websockets
+    try:
+        url = f"{WS_BASE}/ws/exec?container={cid}"
+        async with websockets.connect(url, open_timeout=15) as ws:
+            await asyncio.sleep(0.4)
+            await ws.send(json.dumps({"type": "resize", "cols": 132, "rows": 43}))
+            await asyncio.sleep(0.4)
+            # `stty size` prints "<rows> <cols>" as the kernel sees it.
+            await ws.send(json.dumps({"type": "input", "data": "stty size\n"}))
+            collected = ""
+            deadline = asyncio.get_event_loop().time() + 15
+            while asyncio.get_event_loop().time() < deadline:
+                try:
+                    chunk = await asyncio.wait_for(ws.recv(), timeout=3)
+                except asyncio.TimeoutError:
+                    break
+                collected += chunk
+                if "43 132" in collected:
+                    break
+            ok = "43 132" in collected
+            record("WS /ws/exec PTY resize", ok,
+                   f"stty size -> {'43 132' if ok else collected[-60:]!r}")
+    except Exception as e:
+        record("WS /ws/exec PTY resize", False, repr(e))
 
 
 # ---------------------------------------------------------------- main ----
@@ -266,6 +303,7 @@ def main():
 
     asyncio.run(test_ws_logs(target["name"]))
     asyncio.run(test_ws_exec(cid))
+    asyncio.run(test_ws_exec_resize(cid))
 
     test_image_remove(image_ref)
 
