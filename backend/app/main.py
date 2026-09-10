@@ -2,6 +2,7 @@ from fastapi import FastAPI
 
 from app.config import get_settings
 from app.routers import containers as containers_router
+from app.routers import images as images_router
 
 app = FastAPI(title="docker-manager")
 
@@ -12,3 +13,4 @@ def health():
 
 
 app.include_router(containers_router.router)
+app.include_router(images_router.router)
