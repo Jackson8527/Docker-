@@ -6,11 +6,19 @@ router = APIRouter(prefix="/api/containers", tags=["containers"])
 
 
 def _info(cont) -> ContainerInfo:
+    """Map a docker-py Container to our API model.
+
+    NOTE: docker-py Container has no `.state` attribute; state lives in
+    `attrs["State"]["Status"]` (and `.status` mirrors it). Image tags is a
+    list, so we surface the first tag as the display image name.
+    """
+    state_obj = cont.attrs.get("State", {}) or {}
+    tags = (cont.image.tags if cont.image else None) or []
     return ContainerInfo(
         id=cont.id,
-        name=cont.name or "",
-        image=cont.image.tags,
-        state=cont.state,
+        name=(cont.name or "").lstrip("/"),
+        image=tags[0] if tags else "",
+        state=state_obj.get("Status", "") or cont.status,
         status=cont.status,
         ports=str(cont.ports or []),
         created=cont.attrs.get("Created", ""),
