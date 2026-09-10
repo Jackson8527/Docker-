@@ -10,6 +10,12 @@ build/
 node_modules/
 frontend/dist/
 frontend/node_modules/
+.npm-cache/
+
+# build/vite artifacts
+frontend/vite.config.js
+frontend/vite.config.d.ts
+frontend/*.tsbuildinfo
 
 # Env / local
 .env
