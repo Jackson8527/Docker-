@@ -10,13 +10,15 @@
       <div class="dm-toolbar">
         <el-input
           v-model="pullName"
-          placeholder="拉取镜像，如 nginx:latest"
+          placeholder="拉取镜像，如 mysql:latest"
           style="width: 230px"
           @keyup.enter="doPull"
         />
-        <el-button type="primary" :icon="Download" :loading="pulling" @click="doPull">
-          拉取
-        </el-button>
+        <el-tooltip :content="mirrorHint" placement="bottom" :show-after="300">
+          <el-button type="primary" :icon="Download" :loading="pulling" @click="doPull">
+            拉取
+          </el-button>
+        </el-tooltip>
         <el-input
           v-model="keyword"
           placeholder="搜索"
@@ -53,9 +55,12 @@
           </template>
         </el-table-column>
 
-        <el-table-column label="操作" width="170" align="right" fixed="right">
+        <el-table-column label="操作" width="250" align="right" fixed="right">
           <template #default="{ row }">
             <div class="dm-row-actions">
+              <el-button size="small" type="primary" plain :icon="VideoPlay" @click="openRun(row)">
+                运行
+              </el-button>
               <el-button size="small" plain :icon="Download" @click="exportImage(row)">
                 导出
               </el-button>
@@ -74,20 +79,33 @@
         </template>
       </el-table>
     </div>
+
+    <RunContainerDialog v-model="showRun" :image="runImage" @created="load" />
   </div>
 </template>
 
 <script setup lang="ts">
 import { ref, computed, onMounted } from 'vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
-import { Search, Refresh, Download, Delete, Picture } from '@element-plus/icons-vue'
+import { Search, Refresh, Download, Delete, Picture, VideoPlay } from '@element-plus/icons-vue'
 import { imagesApi, type ImageRow } from '../api'
+import { showApiError } from '../utils/error'
+import RunContainerDialog from '../components/RunContainerDialog.vue'
 
 const rows = ref<ImageRow[]>([])
 const loading = ref(false)
 const pulling = ref(false)
 const pullName = ref('')
 const keyword = ref('')
+const mirrors = ref<string[]>([])
+const showRun = ref(false)
+const runImage = ref('')
+
+const mirrorHint = computed(() =>
+  mirrors.value.length
+    ? `若 Docker Hub 不可达，将自动依次尝试镜像源：${mirrors.value.join(' → ')}，拉取成功后自动打回原名`
+    : '未配置镜像源（IMAGE_MIRRORS 为空）'
+)
 
 const filtered = computed(() => {
   const k = keyword.value.trim().toLowerCase()
@@ -101,8 +119,16 @@ const shortId = (id: string) => (id || '').replace('sha256:', '').slice(0, 12)
 const shortDigest = (d?: string) => (d || '').replace('sha256:', '').slice(0, 12) || '—'
 
 function fail(err: unknown) {
-  const e = err as { response?: { data?: { detail?: string } } }
-  ElMessage.error(e.response?.data?.detail || String(err))
+  showApiError(err)
+}
+
+async function loadMirrors() {
+  try {
+    const r = await imagesApi.mirrors()
+    mirrors.value = r.data?.mirrors ?? []
+  } catch {
+    mirrors.value = []
+  }
 }
 
 async function load() {
@@ -129,8 +155,10 @@ async function doPull() {
 
   pulling.value = true
   try {
-    await imagesApi.pull(name, tag)
-    ElMessage.success(`已拉取 ${name}:${tag}`)
+    const r = await imagesApi.pull(name, tag)
+    const source = r.data?.source
+    const via = source && source !== 'direct' ? `（经镜像源 ${source}）` : ''
+    ElMessage.success(`已拉取 ${r.data?.image || `${name}:${tag}`}${via}`)
     pullName.value = ''
     load()
   } catch (err) {
@@ -164,7 +192,16 @@ async function removeRow(row: ImageRow) {
   }
 }
 
-onMounted(load)
+function openRun(row: ImageRow) {
+  // Dangling images have no tag; the id works as a runnable reference.
+  runImage.value = row.tags?.[0] || row.id
+  showRun.value = true
+}
+
+onMounted(() => {
+  load()
+  loadMirrors()
+})
 </script>
 
 <style scoped>

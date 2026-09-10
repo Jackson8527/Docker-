@@ -16,6 +16,7 @@
           style="width: 220px"
         />
         <el-switch v-model="showAll" active-text="含已停止" @change="load" />
+        <el-button type="primary" :icon="Plus" @click="openRun">新建容器</el-button>
         <el-button :icon="Refresh" :loading="loading" @click="load">刷新</el-button>
       </div>
     </div>
@@ -156,6 +157,9 @@
         <el-button type="primary" :loading="committing" @click="doCommit">打包</el-button>
       </template>
     </el-dialog>
+
+    <!-- 新建容器 -->
+    <RunContainerDialog v-model="showRun" @created="onCreated" />
   </div>
 </template>
 
@@ -171,17 +175,20 @@ import {
   FolderOpened,
   Box,
   Delete,
+  Plus,
 } from '@element-plus/icons-vue'
 import { containersApi, type ContainerRow } from '../api'
 import ContainerLogs from '../components/ContainerLogs.vue'
 import ContainerTerminal from '../components/ContainerTerminal.vue'
 import FileCopyDrawer from '../components/FileCopyDrawer.vue'
+import RunContainerDialog from '../components/RunContainerDialog.vue'
 
 const rows = ref<ContainerRow[]>([])
 const loading = ref(false)
 const keyword = ref('')
 const showAll = ref(true)
 const active = ref<ContainerRow | null>(null)
+const showRun = ref(false)
 
 const drawer = reactive({ logs: false, terminal: false, copy: false, commit: false })
 const commitRepo = ref('')
@@ -273,6 +280,16 @@ async function removeRow(row: ContainerRow) {
   } catch (err) {
     if (err !== 'cancel') fail(err)
   }
+}
+
+function openRun() {
+  showRun.value = true
+}
+
+function onCreated() {
+  // A new container may be stopped; make sure it shows up in the list.
+  showAll.value = true
+  load()
 }
 
 onMounted(load)

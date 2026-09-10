@@ -275,6 +275,78 @@ async def test_ws_exec_resize(cid):
         record("WS /ws/exec PTY resize", False, repr(e))
 
 
+# ---------------------------------------------------------- run container ----
+
+
+def test_run_container():
+    """Create, verify and clean up a container built from a local image."""
+    name = "dockermgr-e2e-run-" + uuid.uuid4().hex[:6]
+    cid = None
+    try:
+        st, body = http("GET", "/api/images")
+        tags = [t for img in json.loads(body) for t in (img.get("tags") or [])]
+        image = next(
+            (t for t in ("nginx:alpine", "alpine:latest", "python:3.12-slim") if t in tags),
+            tags[0] if tags else None,
+        )
+        if not image:
+            record("Run container from image", False, "no local image available")
+            return
+
+        # A bare '80' publishes the container port on a random host port.
+        st, body = http(
+            "POST",
+            "/api/containers",
+            {
+                "image": image,
+                "name": name,
+                "ports": "80",
+                "env": "E2E_MARKER=1",
+                "restart_policy": "no",
+                "auto_start": True,
+            },
+            timeout=180,
+        )
+        created = json.loads(body)
+        cid = created["id"]
+        ok = st == 200 and created["name"] == name
+        record("Run container from image", ok,
+               f"{image} -> {created['name']} ({created['state']})")
+
+        st, body = http("GET", f"/api/containers/{cid}")
+        info = json.loads(body)
+        record("Created container is running", info.get("state") == "running",
+               f"state={info.get('state')}")
+
+        if info.get("ports"):
+            record("Created container published its port", "->" in info["ports"],
+                   info["ports"])
+    except Exception as e:
+        record("Run container from image", False, repr(e))
+    finally:
+        if cid:
+            for method, path in (("POST", f"/api/containers/{cid}/stop"),
+                                 ("DELETE", f"/api/containers/{cid}")):
+                try:
+                    http(method, path, timeout=60)
+                except Exception:
+                    pass
+
+
+def test_run_container_validation():
+    """Bad form input must be a readable 400, not a 500."""
+    try:
+        try:
+            http("POST", "/api/containers", {"image": "alpine", "ports": "not-a-port"})
+            record("Create container rejects bad ports", False, "expected HTTP 400")
+        except urllib.error.HTTPError as e:
+            detail = json.loads(e.read()).get("detail", "")
+            record("Create container rejects bad ports", e.code == 400,
+                   f"HTTP {e.code}: {str(detail)[:50]}")
+    except Exception as e:
+        record("Create container rejects bad ports", False, repr(e))
+
+
 # ---------------------------------------------------------------- main ----
 def main():
     print("=" * 70)
@@ -300,6 +372,9 @@ def main():
     test_file_copy(cid)
     image_ref = test_commit(cid)
     test_image_export(image_ref)
+
+    test_run_container()
+    test_run_container_validation()
 
     asyncio.run(test_ws_logs(target["name"]))
     asyncio.run(test_ws_exec(cid))
