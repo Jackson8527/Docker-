@@ -24,3 +24,7 @@ Thumbs.db
 # DSH / temp
 *.tmp
 _tmp_*
+
+# pytest
+.pytest_cache/
+pytest-cache-files-*
