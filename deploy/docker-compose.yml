@@ -9,6 +9,9 @@ services:
       - DOCKER_HOST=unix:///var/run/docker.sock
       - PORT=8088
       - TMP_DIR=/tmp/dockermgr
+      # Fallback registries used when Docker Hub is unreachable.
+      # Comma-separated; set to an empty string to disable the fallback.
+      - IMAGE_MIRRORS=${IMAGE_MIRRORS:-docker.m.daocloud.io,docker.1panel.live}
     # Internal only, not exposed to host directly.
     expose:
       - "8088"
