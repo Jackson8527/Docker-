@@ -1,5 +1,15 @@
 import axios from 'axios'
 
+export interface ContainerRow {
+  id: string
+  name: string
+  image: string
+  state: string
+  status: string
+  ports: string
+  created: string
+}
+
 const http = axios.create({ baseURL: '/api', timeout: 30000 })
 
 export const containersApi = {
