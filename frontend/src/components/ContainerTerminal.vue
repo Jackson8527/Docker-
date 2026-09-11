@@ -7,6 +7,7 @@
         <span v-if="cols && rows" class="term-size">{{ cols }} × {{ rows }}</span>
       </div>
       <div class="term-actions">
+        <span class="term-tip">选中文本 Ctrl+C 复制 · Ctrl+V / 右键 粘贴</span>
         <el-button size="small" :icon="Refresh" @click="reconnect">重连</el-button>
         <el-button size="small" :icon="Brush" @click="clearScreen">清屏</el-button>
       </div>
@@ -17,6 +18,7 @@
 
 <script setup lang="ts">
 import { ref, computed, onMounted, onUnmounted, nextTick } from 'vue'
+import { ElMessage } from 'element-plus'
 import { Refresh, Brush } from '@element-plus/icons-vue'
 import { Terminal } from '@xterm/xterm'
 import { FitAddon } from '@xterm/addon-fit'
@@ -94,6 +96,99 @@ function clearScreen() {
   term?.clear()
 }
 
+// ------------------------------------------------------------- clipboard --
+//
+// xterm copies only through the browser's native `copy` event, and its default
+// key handling sends Ctrl+C to the PTY as \x03. So selecting text and pressing
+// Ctrl+C used to interrupt the running command instead of copying it, and
+// paste relied on a native event that does not reliably arrive. Wire both up
+// explicitly instead.
+
+async function copySelection() {
+  const text = term?.getSelection() ?? ''
+  if (!text) return
+
+  try {
+    await navigator.clipboard.writeText(text)
+    ElMessage({ message: '已复制', type: 'success', duration: 1200 })
+    return
+  } catch {
+    // Clipboard API unavailable (permission denied or non-secure context).
+  }
+
+  // Legacy fallback: a throwaway textarea plus execCommand.
+  const ta = document.createElement('textarea')
+  ta.value = text
+  ta.setAttribute('readonly', '')
+  ta.style.position = 'fixed'
+  ta.style.top = '-1000px'
+  ta.style.opacity = '0'
+  document.body.appendChild(ta)
+  ta.select()
+  try {
+    document.execCommand('copy')
+    ElMessage({ message: '已复制', type: 'success', duration: 1200 })
+  } catch {
+    ElMessage.warning('复制失败，请手动选中后使用浏览器复制')
+  } finally {
+    document.body.removeChild(ta)
+  }
+}
+
+async function pasteFromClipboard() {
+  term?.focus()
+  try {
+    const text = await navigator.clipboard.readText()
+    // term.paste() applies bracketed-paste mode and normalises line endings.
+    if (text) term?.paste(text)
+  } catch {
+    ElMessage.warning('浏览器未允许读取剪贴板，请在地址栏放开权限后重试')
+  }
+}
+
+/** Right-click pastes, matching Windows Terminal / PuTTY habits. */
+function onContextMenu(ev: MouseEvent) {
+  ev.preventDefault()
+  ev.stopPropagation()
+  pasteFromClipboard()
+}
+
+function onCustomKey(ev: KeyboardEvent): boolean {
+  if (ev.type !== 'keydown') return true
+
+  // Leave Alt/Ctrl+Alt combinations to the shell.
+  if (!(ev.ctrlKey || ev.metaKey) || ev.altKey) return true
+
+  const key = ev.key.toLowerCase()
+
+  if (key === 'c') {
+    if (term?.hasSelection()) {
+      // Copy, and swallow the key so the shell does not also receive \x03.
+      // Returning false also lets the browser raise its native copy event,
+      // which writes the same text - so this still works if the async
+      // clipboard API is blocked.
+      copySelection()
+      return false
+    }
+    // No selection: plain Ctrl+C keeps its SIGINT meaning, while an explicit
+    // Ctrl+Shift+C should send nothing at all.
+    return !ev.shiftKey
+  }
+
+  if (key === 'v') {
+    // xterm consumes Ctrl+V by default, which suppresses the browser's native
+    // paste event - that is exactly why paste did not work at all. Returning
+    // false lets the event through; xterm's own textarea listener then pastes
+    // it, with no clipboard permission needed.
+    //
+    // Do NOT paste here as well: doing so sends the text twice (the native
+    // event fires once we stop consuming the key).
+    return false
+  }
+
+  return true
+}
+
 function connect() {
   status.value = 'connecting'
   cols.value = 0
@@ -165,6 +260,8 @@ onMounted(async () => {
   term.open(hostEl.value)
 
   term.onData((data) => send({ type: 'input', data }, true))
+  term.attachCustomKeyEventHandler(onCustomKey)
+  hostEl.value.addEventListener('contextmenu', onContextMenu, true)
 
   // The single source of truth for sizing: fires when the drawer opens,
   // finishes its transition, or the window is resized.
@@ -177,6 +274,7 @@ onMounted(async () => {
 
 onUnmounted(() => {
   disposed = true
+  hostEl.value?.removeEventListener('contextmenu', onContextMenu, true)
   observer?.disconnect()
   observer = null
   if (ws) {
@@ -236,6 +334,18 @@ onUnmounted(() => {
   background: #1e293b;
   color: #64748b;
   font-family: monospace;
+}
+
+.term-tip {
+  font-size: 11px;
+  color: #64748b;
+  margin-right: 4px;
+}
+
+.term-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
 }
 
 .term-actions :deep(.el-button) {
