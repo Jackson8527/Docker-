@@ -2,7 +2,10 @@
 __pycache__/
 *.py[cod]
 .venv/
-uv.lock
+# NOTE: uv.lock is deliberately COMMITTED, not ignored. backend/Dockerfile does
+# `COPY pyproject.toml uv.lock ./` then `uv sync --frozen`, so a fresh clone
+# must contain it - a local build only succeeds because the file happens to sit
+# on disk. This mirrors frontend/package-lock.json, which is committed too.
 dist/
 build/
 
