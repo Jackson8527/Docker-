@@ -57,11 +57,29 @@ def _canonical(name: str) -> str:
     return ref
 
 
+def _repo_digest(img) -> str:
+    """The registry manifest digest, e.g. 'sha256:...'.
+
+    This is NOT the image id: `img.short_id` is the config digest, so using it
+    here made the Digest column an exact copy of the ID column. Locally built
+    images have no RepoDigests and yield "".
+    """
+    digests = (getattr(img, "attrs", None) or {}).get("RepoDigests") or []
+    if not digests:
+        return ""
+    return str(digests[0]).split("@")[-1]
+
+
 @router.get("")
 def list_images():
     try:
         return [
-            {"id": img.id, "tags": img.tags, "digest": img.short_id}
+            {
+                "id": img.id,
+                "tags": img.tags,
+                "digest": _repo_digest(img),
+                "short_id": img.short_id.replace("sha256:", "")[:12],
+            }
             for img in get_docker_client().images.list()
         ]
     except Exception as e:

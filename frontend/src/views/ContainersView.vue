@@ -37,15 +37,19 @@
           </template>
         </el-table-column>
 
-        <el-table-column label="镜像" min-width="200">
+        <el-table-column label="镜像" min-width="230">
           <template #default="{ row }">
-            <span class="dm-mono c-image">{{ row.image || '—' }}</span>
+            <span class="dm-mono c-image" :title="row.image || ''">{{ row.image || '—' }}</span>
           </template>
         </el-table-column>
 
-        <el-table-column label="端口" min-width="170">
+        <el-table-column label="端口" min-width="200">
           <template #default="{ row }">
-            <span v-if="row.ports" class="dm-mono">{{ row.ports }}</span>
+            <div v-if="row.ports" class="c-ports">
+              <div v-for="p in splitPorts(row.ports)" :key="p" class="dm-mono c-port">
+                {{ p }}
+              </div>
+            </div>
             <span v-else class="c-muted">—</span>
           </template>
         </el-table-column>
@@ -205,6 +209,14 @@ const filtered = computed(() => {
 
 const shortId = (id: string) => id.slice(0, 12)
 
+/** Split '8080->80/tcp, 443->443/tcp' so each mapping gets its own line. */
+function splitPorts(ports: string): string[] {
+  return ports
+    .split(',')
+    .map((s) => s.trim())
+    .filter(Boolean)
+}
+
 function fmtTime(iso: string) {
   if (!iso) return '—'
   const d = new Date(iso)
@@ -301,9 +313,29 @@ onMounted(load)
   color: var(--dm-text);
 }
 
+/* Long image names are truncated rather than broken mid-token: wrapping put
+   'neo4j-gds:5.26.14-gds2.13.2' on two lines as '...:5.26.' / '14-gds2.13.2',
+   which reads like the version is '5.26.'. The full name is in the title. */
 .c-image {
+  display: block;
   color: #475569;
-  word-break: break-all;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+/* One mapping per line, and never break inside one: the previous single
+   string broke mid-token, turning '127.0.0.1:17474->7474/tcp' into
+   '127.0.0.1:17474-' / '>7474/tcp' and making row heights uneven. */
+.c-ports {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.c-port {
+  white-space: nowrap;
+  color: #475569;
 }
 
 .c-muted {

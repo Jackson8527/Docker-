@@ -34,3 +34,8 @@ _tmp_*
 # pytest
 .pytest_cache/
 pytest-cache-files-*
+
+# Browser automation tooling / UI verification output
+.browser-tools/
+.uv-cache/
+scripts/ui-shots/

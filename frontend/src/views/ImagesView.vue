@@ -43,15 +43,15 @@
           </template>
         </el-table-column>
 
-        <el-table-column label="镜像 ID" width="180">
+        <!-- With Docker's containerd image store the image ID *is* the manifest
+             digest, so a separate digest column was pure duplication. The full
+             sha256 stays available on hover, and still applies on classic
+             overlay2 hosts where the two genuinely differ. -->
+        <el-table-column label="镜像 ID" min-width="220">
           <template #default="{ row }">
-            <span class="dm-mono">{{ shortId(row.id) }}</span>
-          </template>
-        </el-table-column>
-
-        <el-table-column label="Digest" width="180">
-          <template #default="{ row }">
-            <span class="dm-mono">{{ shortDigest(row.digest) }}</span>
+            <span class="dm-mono" :title="row.digest || row.id">
+              {{ row.short_id || shortId(row.id) }}
+            </span>
           </template>
         </el-table-column>
 
@@ -116,7 +116,6 @@ const filtered = computed(() => {
 })
 
 const shortId = (id: string) => (id || '').replace('sha256:', '').slice(0, 12)
-const shortDigest = (d?: string) => (d || '').replace('sha256:', '').slice(0, 12) || '—'
 
 function fail(err: unknown) {
   showApiError(err)

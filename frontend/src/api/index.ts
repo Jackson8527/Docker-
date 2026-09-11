@@ -13,7 +13,9 @@ export interface ContainerRow {
 export interface ImageRow {
   id: string
   tags: string[] | null
+  /** Registry manifest digest; empty for locally built images. */
   digest?: string
+  short_id?: string
 }
 
 export interface NetworkRow {
