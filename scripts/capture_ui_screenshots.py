@@ -32,6 +32,64 @@ non-empty text, log lines rendered, xterm prompt printed), so a skeleton screen
 or an empty table can never end up in the manual. A shot that still fails its
 assertion after `ATTEMPTS` attempts is reported as FAILED, not silently kept.
 
+A captured frame can silently lose content (why the pixel check exists)
+----------------------------------------------------------------------
+Measured on this machine (2026-09-14), on the volumes page, whose 驱动 column
+renders one `el-tag` chip per row (`VolumesView.vue:33`). The same script, run
+twice back to back, wrote two very different files:
+
+    good frame  09-volumes.png = 106,855 bytes
+                ink inside the live chip rect (x657..697, y180..200) = 250 px
+                (rgb(160,207,255) x90 = the chip border, rgb(37,99,235) x14 =
+                 the glyph cores of "local")
+    bad frame   09-volumes.png = 102,592 bytes
+                ink inside the very same rect = 0 px; the only mark left in the
+                whole cell was the grey row separator at y=210
+    one script run: 102,890 (bad)   next script run: 106,855 (good)
+
+The delivered PNG carried the bad frame while everything else in those rows was
+pixel-identical to a good frame (name column, mount point column and the action
+buttons sat at exactly the same x positions), i.e. the page had laid itself out
+correctly and only the chips were missing from the *raster*.
+
+At that same moment the DOM was provably correct, which is why no DOM-level
+assertion - and in particular `is_visible()` - could have stopped it:
+
+    cellOuterHTML  <td ...><div class="cell"><span class="el-tag
+                   el-tag--primary el-tag--small el-tag--plain"><span
+                   class="el-tag__content">local</span></span></div></td>
+    8/8 rows       textContent "local", tag rect 40.5 x 20
+    computed style display inline-flex, visibility visible, opacity 1,
+                   color rgb(37,99,235), border 1px solid rgb(160,207,255)
+    hit test       document.elementFromPoint(677, 190) -> SPAN.el-tag__content
+    API            GET /api/volumes -> driver "local" for all 8 rows
+
+So the defect lives in the capture, and this script now defends against it:
+
+1. `force_frame()` pushes two `requestAnimationFrame` callbacks before every
+   capture, so the shot is taken from a settled frame instead of a pending one.
+2. `shoot(..., probe=...)` decodes the PNG that was just written and counts
+   pixels inside the probe element's own rect (`png_rect_metric`, a hand-written
+   zlib PNG reader - this venv has no Pillow). Metrics are theme aware:
+   `ink`   = pixels that are not white  (light backgrounds, e.g. the chip),
+   `dark`  = max(R,G,B) < 200           (dark text on light chrome),
+   `light` = min(R,G,B) > 150           (light text on the dark log/terminal panes).
+   The rect is inset by a couple of pixels so an element's own border cannot
+   pass the check on its own - a chip that lost only its text still fails. The
+   rect is read only after the element's box has stopped moving (`stable_box`):
+   measured right after a load, one and the same chip reported width
+   8 -> 35 -> 41 px, and sampling inside that window would fail a good frame
+   for the wrong reason. The chip probes therefore measure the *table cell*
+   (fixed by the table layout) rather than the tag inside it.
+3. A frame below the probe's minimum is a bad frame, not a screenshot: the
+   candidate PNG is written to a hidden `.candidate.png` name and is only
+   `os.replace`d onto the real name once it passes, so `docs/images/` can never
+   receive (or keep) a frame that lost its content. The shot is retried on a
+   fresh frame - every attempt re-navigates - up to `ATTEMPTS` (>= 3) times;
+   after that the image is reported FAILED with its attempt number and the
+   measured value, and the run exits 1. A deliberate failure only affects the
+   image it belongs to: the other shots still run and still report.
+
 Exit code
 ---------
 0 = every attempted screenshot was captured and satisfied its assertions
@@ -63,11 +121,15 @@ Usage
 """
 from __future__ import annotations
 
+import os
 import re
+import struct
 import subprocess
 import sys
 import time
+import zlib
 from pathlib import Path
+from typing import NamedTuple
 
 try:
     from playwright.sync_api import Error as PlaywrightError
@@ -89,7 +151,9 @@ except Exception:  # pragma: no cover - older/odd interpreters
     pass
 
 VIEWPORT = {"width": 1440, "height": 900}
-ATTEMPTS = 2
+# Every attempt re-navigates and therefore shoots a fresh frame, so >= 3 is what
+# turns a frame-level flake into a retry instead of a bad manual figure.
+ATTEMPTS = 3
 
 # Containers used for the drawer screenshots. Both are already running and are
 # never touched beyond "look at the logs" / "open a shell" / "read a path".
@@ -104,8 +168,11 @@ BAD_COPY_PATH = "/dsh-no-such-path"     # never exists -> backend answers 500
 # ----------------------------------------------------------------- reporting --
 
 # name -> (status, detail). status is 'ok' | 'failed' | 'skipped'.
-SHOTS: list[tuple[str, str, str]] = []
+SHOTS: list[tuple[str, str, str, int, str]] = []
 SIZES: dict[str, int] = {}
+# file name -> the frame self-check that let it through, e.g.
+# "数据卷驱动 chip 文本 ink=248 (需 >= 60, 区域 x660..695 y183..198)"
+CHECKS: dict[str, str] = {}
 DIAG = {
     "pageerror": [],
     "console_error": [],
@@ -296,12 +363,292 @@ def reset_ui(page) -> None:
         page.wait_for_timeout(300)
 
 
-def shoot(page, name: str, slug: str) -> None:
-    path = OUT / f"{name}-{slug}.png"
-    page.screenshot(path=str(path), full_page=False)
-    size = path.stat().st_size if path.exists() else 0
-    require(size > 0, f"截图文件为空：{path.name}")
-    SIZES[path.name] = size
+# ------------------------------------------------- frame-level content checking --
+# A screenshot is a raster of one frame; the DOM can be perfect and the frame
+# still empty (module docstring). These helpers look at the bytes on disk.
+
+class Probe(NamedTuple):
+    """One "this area must carry content" rule, checked against the PNG.
+
+    `metric`     'ink' | 'dark' | 'light' (see the module docstring)
+    `minimum`    the judge: a frame with fewer such pixels than this FAILED
+    `locator`    callable(page) -> Locator for the element that must carry content
+    `inset`      pixels trimmed from each side, so an element's own border cannot
+                 satisfy the check on its own
+    `max_height` optional cap on the sampled height (keeps the pure-Python PNG
+                 decode cheap for tall panes; the top of the pane is sampled)
+    """
+
+    label: str
+    metric: str
+    minimum: int
+    locator: object
+    inset: int = 2
+    max_height: int | None = None
+
+
+def force_frame(page) -> None:
+    """Let two animation frames run before capturing.
+
+    The delivered bad frame (module docstring) was taken while the compositor
+    still owed the page a paint; waiting for two rAF callbacks pushes the shot
+    past that window. Purely a mitigation - `verify_frame` below is the actual
+    guarantee, because a mitigation is exactly what failed before.
+    """
+    try:
+        page.evaluate(
+            "() => new Promise(r => requestAnimationFrame(() => "
+            "requestAnimationFrame(() => r(null))))"
+        )
+    except PlaywrightError:
+        pass  # a page without rAF must not break the shot
+
+
+def png_rect_metric(path: Path, x0: int, y0: int, x1: int, y1: int, metric: str) -> int:
+    """Count `metric` pixels inside one rect of the PNG stored at `path`.
+
+    A hand-written decoder, because this venv has no Pillow and the check must
+    read the file that was actually written (not a re-render, and not the DOM).
+    Supports 8-bit RGB/RGBA non-interlaced PNGs - what Chromium emits.
+
+    PNG filtering is causal (a byte only depends on bytes above it, to its left
+    and above-left), so only the columns up to `x1` and the rows up to `y1` are
+    reconstructed; that keeps the pure-Python unfiltering affordable.
+    """
+    data = Path(path).read_bytes()
+    if data[:8] != b"\x89PNG\r\n\x1a\n":
+        raise ShotFailed(f"{Path(path).name} 不是 PNG，无法做像素自检")
+    pos, idat = 8, bytearray()
+    width = height = bit_depth = color_type = interlace = None
+    while pos + 8 <= len(data):
+        (length,) = struct.unpack(">I", data[pos:pos + 4])
+        ctag = data[pos + 4:pos + 8]
+        chunk = data[pos + 8:pos + 8 + length]
+        pos += 12 + length
+        if ctag == b"IHDR":
+            width, height, bit_depth, color_type, _c, _f, interlace = struct.unpack(
+                ">IIBBBBB", chunk
+            )
+        elif ctag == b"IDAT":
+            idat += chunk
+        elif ctag == b"IEND":
+            break
+    if bit_depth != 8 or color_type not in (2, 6) or interlace != 0:
+        raise ShotFailed(
+            f"不支持的 PNG 格式：depth={bit_depth} color={color_type} interlace={interlace}"
+        )
+
+    bpp = 4 if color_type == 6 else 3
+    stride = width * bpp
+    y_end = min(y1, height)
+    limit = min(x1, width) * bpp
+    raw = zlib.decompress(bytes(idat))
+    prev = bytearray(stride)
+    cur = bytearray(stride)
+    count = 0
+    for y in range(y_end):
+        base = y * (stride + 1)
+        ftype = raw[base]
+        line = raw[base + 1:base + 1 + limit]
+        if ftype == 0:                                   # None
+            cur[:limit] = line
+        elif ftype == 2:                                 # Up
+            for i in range(limit):
+                cur[i] = (line[i] + prev[i]) & 0xFF
+        else:                                            # Sub / Average / Paeth
+            for i in range(limit):
+                a = cur[i - bpp] if i >= bpp else 0
+                b = prev[i]
+                if ftype == 1:
+                    v = line[i] + a
+                elif ftype == 3:
+                    v = line[i] + ((a + b) >> 1)
+                else:
+                    c = prev[i - bpp] if i >= bpp else 0
+                    p = a + b - c
+                    pa, pb, pc = abs(p - a), abs(p - b), abs(p - c)
+                    pr = a if (pa <= pb and pa <= pc) else (b if pb <= pc else c)
+                    v = line[i] + pr
+                cur[i] = v & 0xFF
+        if y >= y0:
+            row = cur
+            for x in range(x0, min(x1, width)):
+                i = x * bpp
+                r, g, bl = row[i], row[i + 1], row[i + 2]
+                if metric == "ink":
+                    if r < 245 or g < 245 or bl < 245:
+                        count += 1
+                elif metric == "dark":
+                    if r < 200 and g < 200 and bl < 200:
+                        count += 1
+                else:                                    # 'light'
+                    if r > 150 and g > 150 and bl > 150:
+                        count += 1
+        prev, cur = cur, prev
+    return count
+
+
+def stable_box(page, locator, timeout_ms: int = 6000, pause_ms: int = 150):
+    """Wait until an element's box stops moving, then return that box.
+
+    Needed because a freshly loaded list can still be settling: measured on
+    /volumes, the very same chip (`el-tag` with the text "local") reported
+    width 8 -> 35 -> 41 px within one second of the page appearing, and the
+    cell it lives in shifts with it. Measuring a probe rect during that window
+    samples coordinates the element never occupied, which would turn a perfectly
+    good frame into a false "no content" failure - the pixel judge is only as
+    good as the rect it is given.
+    """
+    previous = None
+    deadline = time.time() + timeout_ms / 1000.0
+    while True:
+        box = locator.bounding_box()
+        if box is not None and previous is not None and all(
+            abs(box[key] - previous[key]) < 0.5 for key in ("x", "y", "width", "height")
+        ):
+            return box
+        previous = box
+        if time.time() > deadline:
+            return box  # best effort - the pixel judge below still applies
+        page.wait_for_timeout(pause_ms)
+
+
+def verify_frame(path: Path, page, probe: Probe) -> tuple[str, int]:
+    """Measure the probe element's own rect inside the PNG at `path`.
+
+    Returns `(description, value)` - the description carries every number the
+    report needs (metric, value, threshold and the sampled rect), so a run log
+    alone is enough to see what was judged.
+    """
+    loc = probe.locator(page).first
+    loc.wait_for(state="visible", timeout=10000)
+    box = stable_box(page, loc)
+    require(box is not None, f"自检元素不可见：{probe.label}")
+    right, bottom = box["x"] + box["width"], box["y"] + box["height"]
+    require(
+        box["x"] >= 0 and box["y"] >= 0
+        and right <= VIEWPORT["width"] and bottom <= VIEWPORT["height"],
+        f"{probe.label} 不在视口内（x={box['x']:.0f} y={box['y']:.0f} "
+        f"w={box['width']:.0f} h={box['height']:.0f}），拒绝按被裁切的区域自检",
+    )
+    x0 = int(box["x"]) + probe.inset
+    y0 = int(box["y"]) + probe.inset
+    x1 = int(right) - probe.inset
+    y1 = int(bottom) - probe.inset
+    if probe.max_height is not None:
+        y1 = min(y1, y0 + probe.max_height)
+    require(x1 - x0 >= 2 and y1 - y0 >= 2, f"{probe.label} 可自检区域过小，无法判定")
+    value = png_rect_metric(path, x0, y0, x1, y1, probe.metric)
+    return (
+        f"{probe.label} {probe.metric}={value}（需 >= {probe.minimum}；"
+        f"采样区 x{x0}..{x1} y{y0}..{y1}）",
+        value,
+    )
+
+
+# One probe per screenshot, each naming an element that is *known* to carry
+# content on that screen. Thresholds were calibrated against measured good
+# frames and sit at roughly a quarter of them, because the failure they exist to
+# catch is not "slightly less ink" but "this element is not in the frame at all"
+# (measured: 250 ink px for a good volumes chip, 0 for the delivered bad frame).
+PROBE_CONTAINER_NAME = Probe(
+    "容器名单元格文本", "dark", 40,
+    lambda pg: pg.locator(".el-table__body tr").first.locator(".c-name").first,  # ContainersView.vue:35
+)
+PROBE_RUN_PORTS = Probe(
+    "运行向导端口映射输入框内的文字", "dark", 25,
+    lambda pg: pg.locator(".el-dialog textarea").first, inset=4,   # RunContainerDialog.vue:45
+)
+PROBE_LOG_BODY = Probe(
+    "日志面板内的日志文字", "light", 150,
+    lambda pg: pg.locator(".log-body").first, inset=1, max_height=120,  # ContainerLogs.vue:44
+)
+PROBE_TERM_PROMPT = Probe(
+    "终端 shell 提示符", "light", 20,
+    lambda pg: pg.locator(".xterm-rows").first, inset=0, max_height=160,
+)
+PROBE_COPY_TITLE = Probe(
+    "文件拷贝区块标题", "dark", 20,
+    lambda pg: pg.get_by_text("从本机拷入容器").first, inset=1,     # FileCopyDrawer.vue:7
+)
+
+
+def _chip_probe(label: str, cell_index: int) -> Probe:
+    """The chip column of the first row - the exact area that flaked.
+
+    The probe is the *table cell*, not the `el-tag` inside it: the cell's box is
+    fixed by the table layout, while the tag's own width is part of what was
+    measuring unstably (8 -> 35 -> 41 px; see `stable_box`). The inset trims the
+    cell's edges, so the row separator line cannot pass the check by itself -
+    only the chip inside the cell contributes ink.
+
+    Threshold 60 sits between the two measured states with room on both sides:
+    the delivered bad frame left ~13 subpixel-fringe pixels in this cell, good
+    frames carry 212 (narrowest chip, the networks page's literal "null") to 861.
+    """
+    return Probe(
+        label, "ink", 60,
+        lambda pg: pg.locator(".el-table__body tr").first.locator("td").nth(cell_index),
+        inset=3,
+    )
+
+
+PROBE_IMAGE_TAG = _chip_probe("镜像标签 chip 所在单元格", 0)      # ImagesView.vue:38
+PROBE_NET_DRIVER = _chip_probe("网络驱动 chip 所在单元格", 1)     # NetworksView.vue:33
+PROBE_VOL_DRIVER = _chip_probe("数据卷驱动 chip 所在单元格", 1)   # VolumesView.vue:33
+PROBE_ERR_TEXT = Probe(
+    "错误提示正文", "dark", 40,
+    lambda pg: pg.locator(".el-message-box__message").first, inset=2,  # utils/error.ts:27
+)
+
+
+def shoot(page, name: str, slug: str, probe: "Probe | None" = None) -> None:
+    """Capture one screenshot, verify the frame, and only then publish it.
+
+    Order matters and is the whole defence (see the module docstring):
+    `force_frame` -> write a candidate PNG -> decode that PNG and count pixels
+    inside the probe's rect -> `os.replace` onto the real name only if the count
+    is high enough. A frame that lost its content therefore never reaches
+    `docs/images/`; the caller retries with a fresh frame and, after ATTEMPTS
+    failures, reports the image as FAILED.
+    """
+    final = OUT / f"{name}-{slug}.png"
+    candidate = OUT / f".{name}-{slug}.candidate.png"
+    if probe is not None:
+        # The probe element must have stopped moving before the shutter opens,
+        # otherwise the frame can catch it mid-layout (see `stable_box`).
+        probe_loc = probe.locator(page).first
+        probe_loc.wait_for(state="visible", timeout=10000)
+        stable_box(page, probe_loc)
+    force_frame(page)                                  # defence 1: settled frame
+    page.screenshot(path=str(candidate), full_page=False)
+    size = candidate.stat().st_size if candidate.exists() else 0
+    require(size > 0, f"截图文件为空：{candidate.name}")
+    check = "未配置自检（该图只有 DOM 断言）"
+    if probe is not None:                              # defence 2: read the pixels
+        check, value = verify_frame(candidate, page, probe)
+        require(value >= probe.minimum, f"帧自检未通过：{check} —— 这一帧丢了内容")
+    os.replace(candidate, final)                       # defence 3: publish
+    SIZES[final.name] = final.stat().st_size
+    CHECKS[final.name] = check
+
+
+def discard_candidate(name: str, slug: str) -> None:
+    """Delete a candidate PNG that failed its check, so no bad frame lingers."""
+    stale = OUT / f".{name}-{slug}.candidate.png"
+    try:
+        stale.unlink()
+    except OSError:
+        pass
+
+
+def sweep_candidates() -> None:
+    """Remove candidates left behind by an earlier crashed run."""
+    for stale in OUT.glob(".*.candidate.png"):
+        try:
+            stale.unlink()
+        except OSError:
+            pass
 
 
 # ---------------------------------------------------------------------- shots --
@@ -323,7 +670,7 @@ def shot_containers(page) -> str:
     title = page.locator(".dm-page-title").first.inner_text().strip()  # ContainersView.vue:5
     require("容器" in title, f"页面标题异常：{title!r}")
     health = page.locator(".dm-health").first.inner_text().strip()     # App.vue:35
-    shoot(page, "01", "containers")
+    shoot(page, "01", "containers", PROBE_CONTAINER_NAME)
     require(page.locator(".el-table__body tr").count() > 0, "截图后表格行消失")
     return f"{rows} 行；导航={nav}；表头={head}；标题={title!r}；服务状态={health!r}"
 
@@ -364,7 +711,7 @@ def shot_run_dialog(page) -> str:
     submit.wait_for(state="visible", timeout=5000)
 
     wait_settled(page, ".el-dialog:visible")
-    shoot(page, "03", "run-dialog")
+    shoot(page, "03", "run-dialog", PROBE_RUN_PORTS)
     # Safety: the submit button was only ever looked at, never clicked - the
     # dialog must therefore still be open, and no container may have appeared.
     require(page.locator(".el-dialog:visible").count() > 0, "运行向导在未提交的情况下关闭了")
@@ -386,7 +733,7 @@ def shot_logs(page) -> str:
     state = page.locator(".log-state").first.inner_text().strip()  # ContainerLogs.vue:15
     first = page.locator(".log-line").first.inner_text().strip()
     wait_settled(page, ".el-drawer:visible")
-    shoot(page, "04", "logs")
+    shoot(page, "04", "logs", PROBE_LOG_BODY)
     require(page.locator(".log-line").count() > 0, "截图后日志行消失")
     # Close the stream, then the drawer: no websocket is left dangling.
     # Teardown failures are reported but must not undo a good screenshot.
@@ -431,7 +778,7 @@ def shot_terminal(page) -> str:
         text = poll(page, prompt_text, 15000)
     require(bool(text), "终端已连接但没有出现 shell 提示符")
     wait_settled(page, ".el-drawer:visible")
-    shoot(page, "05", "terminal")
+    shoot(page, "05", "terminal", PROBE_TERM_PROMPT)
     require(page.locator(".xterm").count() > 0, "截图后终端消失")
     # Detach the session, then close the drawer (both are needed: 断开 stops the
     # stream, unmounting the drawer releases the socket for good). Teardown
@@ -461,7 +808,7 @@ def shot_file_copy(page) -> str:
     dest = page.get_by_placeholder("/tmp").input_value()         # FileCopyDrawer.vue:26
     src = page.get_by_placeholder("/app/logs").input_value()     # FileCopyDrawer.vue:55
     wait_settled(page, ".el-drawer:visible")
-    shoot(page, "06", "file-copy")
+    shoot(page, "06", "file-copy", PROBE_COPY_TITLE)
     require(page.get_by_text("从本机拷入容器").is_visible(), "截图后抽屉内容消失")
     reset_ui(page)
     return f"{head!r}；默认目标目录={dest!r}；默认源路径={src!r}"
@@ -492,13 +839,14 @@ def shot_error_toast(page) -> str:
     text = box.inner_text().strip()
     require(bool(text), "错误提示没有文本内容")
     wait_settled(page, ".el-message-box:visible")
-    shoot(page, "10", "error-toast")
+    shoot(page, "10", "error-toast", PROBE_ERR_TEXT)
     require(bool(box.inner_text().strip()), "截图后错误提示消失")
     reset_ui(page)
     return f"{kind}；文本={text.replace(chr(10), ' / ')[:120]!r}"
 
 
-def shot_simple(page, path: str, name: str, slug: str, expect: tuple[str, ...]) -> str:
+def shot_simple(page, path: str, name: str, slug: str, expect: tuple[str, ...],
+                probe: Probe | None = None) -> str:
     """07/08/09 - images / networks / volumes list pages."""
     goto(page, path)
     rows = wait_rows(page)
@@ -508,24 +856,24 @@ def shot_simple(page, path: str, name: str, slug: str, expect: tuple[str, ...]) 
     for expected in expect:
         require(expected in head, f"{path} 表头缺少「{expected}」：{head}")
     title = page.locator(".dm-page-title").first.inner_text().strip()
-    shoot(page, name, slug)
+    shoot(page, name, slug, probe)
     require(page.locator(".el-table__body tr").count() > 0, "截图后表格行消失")
     return f"{rows} 行；标题={title!r}；表头={head}"
 
 
 def shot_images(page) -> str:
     return shot_simple(page, "/images", "07", "images",
-                       ("标签", "镜像 ID", "操作"))            # ImagesView.vue:35-58
+                       ("标签", "镜像 ID", "操作"), PROBE_IMAGE_TAG)   # ImagesView.vue:35-58
 
 
 def shot_networks(page) -> str:
     return shot_simple(page, "/networks", "08", "networks",
-                       ("名称", "驱动", "范围", "操作"))        # NetworksView.vue:25-49
+                       ("名称", "驱动", "范围", "操作"), PROBE_NET_DRIVER)  # NetworksView.vue:25-49
 
 
 def shot_volumes(page) -> str:
     return shot_simple(page, "/volumes", "09", "volumes",
-                       ("名称", "驱动", "挂载点", "操作"))      # VolumesView.vue:25-45
+                       ("名称", "驱动", "挂载点", "操作"), PROBE_VOL_DRIVER)  # VolumesView.vue:25-45
 
 
 # `02-container-detail.png` has no implementation on purpose: the product has
@@ -603,6 +951,7 @@ def check_panel() -> None:
 
 def main() -> int:
     OUT.mkdir(parents=True, exist_ok=True)
+    sweep_candidates()          # a crashed earlier run must not leave a candidate
     log(f"输出目录：{OUT}")
     check_panel()
 
@@ -636,25 +985,32 @@ def main() -> int:
             for name, slug, fn in SHOT_TABLE:
                 target = f"{name}-{slug}.png"
                 if fn is None:
-                    SHOTS.append((target, "skipped", SKIP_REASON.get(name, "无可用的界面入口")))
+                    SHOTS.append((target, "skipped", SKIP_REASON.get(name, "无可用的界面入口"), 0, ""))
                     log(f"[skip] {target} -- {SKIP_REASON.get(name, '')}")
                     continue
 
                 log(f"[shot] {target}")
+                had_previous = (OUT / target).exists()
                 error = "未执行"
                 for attempt in range(1, ATTEMPTS + 1):
                     reset_ui(page)
                     try:
                         detail = fn(page)
-                        SHOTS.append((target, "ok", detail))
-                        log(f"  [ok] {target} ({SIZES.get(target, 0)} bytes) -- {detail}")
+                        check = CHECKS.get(target, "")
+                        SHOTS.append((target, "ok", detail, attempt, check))
+                        log(f"  [ok] {target} ({SIZES.get(target, 0)} bytes, 第 {attempt}/{ATTEMPTS} 次尝试)")
+                        log(f"       自检：{check}")
+                        log(f"       内容：{detail}")
                         error = ""
                         break
                     except Exception as exc:  # noqa: BLE001 - reported verbatim
+                        discard_candidate(name, slug)
                         error = f"{type(exc).__name__}: {exc}"
-                        log(f"  [attempt {attempt}/{ATTEMPTS} failed] {error}")
+                        log(f"  [attempt {attempt}/{ATTEMPTS} 失败] {error}")
                         if attempt == ATTEMPTS:
-                            SHOTS.append((target, "failed", error))
+                            SHOTS.append((target, "failed", error, attempt, ""))
+                            if had_previous:
+                                log(f"  [warn] {target} 未被本次运行覆盖，留存的仍是上一次的文件，请勿引用")
                 if error:
                     log(f"  [FAIL] {target} -- {error}")
         finally:
@@ -673,10 +1029,17 @@ def main() -> int:
     log("\n" + "=" * 72)
     log("Docker Manager UI 截图报告")
     log("=" * 72)
-    for target, status, detail in SHOTS:
+    for target, status, detail, attempt, check in SHOTS:
         mark = {"ok": "OK     ", "failed": "FAILED ", "skipped": "SKIPPED"}[status]
-        size = f"{SIZES.get(target, 0):>7} bytes" if status == "ok" else " " * 13
-        log(f"{mark} {target:<24} {size}  {detail}")
+        if status == "ok":
+            log(f"{mark} {target:<24} {SIZES.get(target, 0):>7} bytes  (第 {attempt}/{ATTEMPTS} 次尝试)")
+            log(f"        帧自检：{check}")
+            log(f"        内容  ：{detail}")
+        elif status == "failed":
+            log(f"{mark} {target:<24} {' ' * 13}  (第 {attempt}/{ATTEMPTS} 次尝试仍失败)")
+            log(f"        判据  ：{detail}")
+        else:
+            log(f"{mark} {target:<24} {' ' * 13}  {detail}")
 
     log("\nDocker 资源计数（开工前 -> 收工后）")
     for key in ("containers", "images", "volumes", "networks"):
@@ -704,12 +1067,12 @@ def main() -> int:
     log("\n" + "=" * 72)
     log(f"成功 {len(ok)} 张 / 失败 {len(failed)} 张 / 跳过 {len(skipped)} 张")
     if failed:
-        log("失败清单：")
-        for target, _, detail in failed:
-            log(f"  !! {target} -- {detail}")
+        log("失败清单（含失败时的自检判据数值）：")
+        for target, _, detail, attempt, _check in failed:
+            log(f"  !! {target} -- 第 {attempt}/{ATTEMPTS} 次尝试仍失败 -- {detail}")
     if skipped:
         log("跳过清单（不计入失败）：")
-        for target, _, detail in skipped:
+        for target, _, detail, _attempt, _check in skipped:
             log(f"  -- {target} -- {detail}")
     if counts_changed:
         log("!! Docker 资源计数发生变化，违反只读约束，请立即人工核查")
