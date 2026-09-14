@@ -2,11 +2,24 @@
 
 Verifies: HTTP CRUD endpoints, WebSocket logs, WebSocket exec terminal,
 host<->container file copy, container commit, image export.
+
+This script is a gate: it exits 1 when any check failed, 0 only when all of
+them passed.
+
+Dependencies are declared in scripts/requirements-verify.txt (do not rely on
+whatever happens to be installed transitively):
+
+    pip install -r scripts/requirements-verify.txt
+    python scripts/e2e_verify.py
 """
 import asyncio
 import io
 import json
+import random
+import re
+import sys
 import tarfile
+import time
 import urllib.error
 import urllib.request
 import uuid
@@ -14,12 +27,35 @@ import uuid
 BASE = "http://127.0.0.1:8088"
 WS_BASE = "ws://127.0.0.1:8088"
 
+# How long a websocket check waits for real traffic before it fails.
+WS_WAIT_SECONDS = 20
+
+DEPENDENCY_HINT = "缺少验证依赖。请先安装：pip install -r scripts/requirements-verify.txt"
+
+# websockets is a declared dependency, not an accident of uvicorn[standard].
+try:
+    import websockets
+except ImportError as _exc:  # pragma: no cover - depends on the interpreter
+    websockets = None
+    _WEBSOCKETS_IMPORT_ERROR = repr(_exc)
+else:
+    _WEBSOCKETS_IMPORT_ERROR = None
+
 RESULTS = []
 
 
 def record(name, ok, detail=""):
     RESULTS.append((name, ok, detail))
     print(f"[{'PASS' if ok else 'FAIL'}] {name}" + (f" -- {detail}" if detail else ""))
+
+
+def require_websockets(name):
+    """Return the websockets module, or record a readable FAIL and return None."""
+    if websockets is not None:
+        return websockets
+    record(name, False,
+           f"缺少依赖 websockets（{_WEBSOCKETS_IMPORT_ERROR}）-> {DEPENDENCY_HINT}")
+    return None
 
 
 def http(method, path, data=None, headers=None, timeout=30):
@@ -187,64 +223,232 @@ def test_image_export(image_ref):
 
 
 def test_image_remove(image_ref):
-    """Cleanup the image created by the commit test."""
+    """Delete the image created by the commit test and prove it is gone."""
     if not image_ref:
+        record("Cleanup committed image", False, "skipped: commit produced no image")
         return
     try:
         st, body = http("GET", "/api/images")
         imgs = json.loads(body)
         target = next((i for i in imgs if image_ref in (i.get("tags") or [])), None)
-        if target:
-            http("DELETE", f"/api/images/{target['id']}?force=true", timeout=60)
-        record("Cleanup committed image", True, image_ref)
+        if not target:
+            record("Cleanup committed image", False, f"image {image_ref} not found")
+            return
+
+        st, body = http("DELETE", f"/api/images/{target['id']}?force=true", timeout=60)
+        detail = body.decode(errors="replace")[:80]
+        if st != 200:
+            record("Cleanup committed image", False, f"DELETE -> HTTP {st}: {detail}")
+            return
+        delete_status = st
+
+        # A 200 is not proof: re-list and require the tag to be gone.
+        st, body = http("GET", "/api/images")
+        still = [i for i in json.loads(body) if image_ref in (i.get("tags") or [])]
+        record("Cleanup committed image", not still,
+               f"delete HTTP {delete_status}, tag "
+               f"{'still present' if still else 'gone'}: {image_ref}")
     except Exception as e:
         record("Cleanup committed image", False, repr(e))
 
 
 # ---------------------------------------------------------------- WS ----
-async def test_ws_logs(container_name):
-    import websockets
+LOGS_TEST = "WS /ws/logs (realtime logs)"
+
+# The backend's drop notice is not container output, so it must not be able to
+# satisfy the "at least one real log line" assertion on its own.
+DROP_NOTICE_PREFIX = "... "
+
+
+def control_frame_error(msg):
+    """Return the reason if a text frame is a `{"dockermgr": "error", ...}` frame.
+
+    The backend reports "cannot serve this socket" as a JSON text frame before
+    closing, so a frame is not evidence of a working channel until it has been
+    shown NOT to be one of these.
+
+    The `dockermgr == "error"` discriminator is what distinguishes a protocol
+    frame from a container that happens to log a single JSON line like
+    {"error": "upstream timeout"}: only the former may fail this check, and a
+    real log line must never be swallowed as a protocol frame.
+    """
+    if not isinstance(msg, str):
+        return None
+    text = msg.strip()
+    if not text.startswith("{"):
+        return None
     try:
-        url = f"{WS_BASE}/ws/logs?filter={container_name}&stream=stdout&tail=20"
-        async with websockets.connect(url, open_timeout=15) as ws:
-            try:
-                msg = await asyncio.wait_for(ws.recv(), timeout=15)
-                ok = isinstance(msg, str)
-                record("WS /ws/logs (realtime logs)", ok, f"got {len(msg)} chars")
-            except asyncio.TimeoutError:
-                # A container with no recent output may legitimately stay quiet.
-                record("WS /ws/logs (realtime logs)", True,
-                       "connected, no output within 15s (acceptable)")
+        obj = json.loads(text)
+    except ValueError:
+        return None
+    if not isinstance(obj, dict) or obj.get("dockermgr") != "error":
+        return None
+    reason = obj.get("error")
+    if not isinstance(reason, str) or not reason.strip():
+        return "（服务端失败帧缺少可读原因）"
+    return reason
+
+
+def log_lines_in_frame(msg):
+    """Real log lines inside one frame (frames may carry many `\\n`-joined lines)."""
+    if not isinstance(msg, str):
+        return []
+    lines = msg.split("\n")
+    return [ln for ln in lines if ln.strip() and not ln.startswith(DROP_NOTICE_PREFIX)]
+
+
+# A PTY stream carries cursor/erase sequences around the text a human sees.
+_ANSI_RE = re.compile(r"\x1b\[[0-9;?]*[A-Za-z]|\x1b\][^\x07]*\x07|\x1b[()][A-Z0-9]")
+
+
+def visible_lines(text):
+    """Terminal bytes -> the lines a human would actually read.
+
+    Comparing against these instead of the raw stream is what lets a check tell
+    an executed *result* apart from the PTY's echo of the typed line: the echo
+    of `echo $((1+2))` is a line of its own only once the escape codes and the
+    `\\r` padding are gone.
+    """
+    stripped = _ANSI_RE.sub("", text).replace("\r\n", "\n").replace("\r", "\n")
+    return [line.strip() for line in stripped.split("\n") if line.strip()]
+
+
+async def drain_frames(ws, needles, timeout):
+    """Collect frames until a needle is visible, or the deadline expires.
+
+    Returns `(visible_text, control_frame_error_or_None)`. One collector for all
+    websocket checks keeps the "did the server tell us why it gave up" test in a
+    single place, so a new check cannot forget it.
+    """
+    text = ""
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        try:
+            chunk = await asyncio.wait_for(ws.recv(), timeout=3)
+        except asyncio.TimeoutError:
+            break
+        reason = control_frame_error(chunk)
+        if reason is not None:
+            return text, reason
+        text += chunk
+        if any(needle in text for needle in needles):
+            break
+    return text, None
+
+
+async def test_ws_logs(container_name):
+    ws_mod = require_websockets(LOGS_TEST)
+    if ws_mod is None:
+        return
+    try:
+        url = f"{WS_BASE}/ws/logs?filter={container_name}&stream=both&tail=20"
+        async with ws_mod.connect(url, open_timeout=15) as ws:
+            frames = 0
+            lines: list[str] = []
+            closed = None
+            deadline = time.monotonic() + WS_WAIT_SECONDS
+            while time.monotonic() < deadline:
+                try:
+                    msg = await asyncio.wait_for(
+                        ws.recv(), timeout=max(0.1, deadline - time.monotonic())
+                    )
+                except asyncio.TimeoutError:
+                    break
+                except Exception as e:  # closed by the server or the network
+                    closed = repr(e)
+                    break
+
+                reason = control_frame_error(msg)
+                if reason is not None:
+                    record(LOGS_TEST, False, f"服务端控制帧报错：{reason}")
+                    return
+
+                frames += 1
+                lines.extend(log_lines_in_frame(msg))
+
+            if lines:
+                record(LOGS_TEST, True,
+                       f"收到 {len(lines)} 行真实日志（{frames} 帧），"
+                       f"例：{lines[0][:60]!r}")
+            elif frames:
+                record(LOGS_TEST, False,
+                       f"收到 {frames} 帧但没有任何真实日志行"
+                       f"（容器 {container_name} 无输出或帧内容非法）")
+            elif closed:
+                record(LOGS_TEST, False,
+                       f"连接被对方关闭且未收到任何日志行：{closed}")
+            else:
+                record(LOGS_TEST, False,
+                       f"{WS_WAIT_SECONDS}s 内未收到任何日志行（容器 {container_name}）")
     except Exception as e:
-        record("WS /ws/logs (realtime logs)", False, repr(e))
+        record(LOGS_TEST, False, repr(e))
 
 
 async def test_ws_exec(cid):
-    import websockets
+    """The terminal must deliver *execution output*, not just a PTY echo.
+
+    RD3-06: the old check sent `echo <token>` and asserted the token came back.
+    A PTY echoes the line it is fed, so that assertion was satisfied with the
+    command never running - measured live by putting the token in a shell
+    *comment* (zero output) and watching it arrive anyway
+    (.rd3-probes/exec-echo-probe.txt). The check could not have failed even on a
+    completely dead shell.
+
+    The marker is now a value only the shell can produce, and the echo channel
+    is proved separately so the two can never be confused:
+
+      1. a comment line is echoed but prints nothing, so its text can only come
+         back through the echo - if it does, the stream really is echoing and
+         step 2 is being tested against the channel that caused the false green;
+      2. `echo $((a+b))` must print the sum as a line of its own. Both operands
+         are 6-digit, so the sum is always 7 digits and therefore cannot occur
+         anywhere inside the echoed command text (whose digit runs are 6 long) -
+         the echoed line simply does not contain it.
+    """
+    ws_mod = require_websockets("WS /ws/exec (interactive terminal)")
+    if ws_mod is None:
+        return
+    name = "WS /ws/exec (interactive terminal)"
     try:
+        a = random.randint(500000, 899999)
+        b = random.randint(500000, 899999)
+        total = str(a + b)
+        command = f"echo $(({a}+{b}))"
+        # Belt and braces: if the sum ever leaked into the command text, the
+        # echo alone could produce it and the whole check would be forgeable.
+        assert total not in command, "exec marker is forgeable by the PTY echo"
+        echo_marker = "EXECECHO" + uuid.uuid4().hex[:6]
+
         url = f"{WS_BASE}/ws/exec?container={cid}"
-        async with websockets.connect(url, open_timeout=15) as ws:
+        async with ws_mod.connect(url, open_timeout=15) as ws:
             await asyncio.sleep(0.5)
             # Announce the terminal size first, exactly like the browser does.
             await ws.send(json.dumps({"type": "resize", "cols": 100, "rows": 30}))
             await asyncio.sleep(0.3)
-            token = "EXECOK" + uuid.uuid4().hex[:6]
-            await ws.send(json.dumps({"type": "input", "data": f"echo {token}\n"}))
-            collected = ""
-            deadline = asyncio.get_event_loop().time() + 15
-            while asyncio.get_event_loop().time() < deadline:
-                try:
-                    chunk = await asyncio.wait_for(ws.recv(), timeout=3)
-                except asyncio.TimeoutError:
-                    break
-                collected += chunk
-                if token in collected:
-                    break
-            ok = token in collected
-            record("WS /ws/exec (interactive terminal)", ok,
-                   f"echo roundtrip={'yes' if ok else 'no'}")
+
+            # 1. echo channel: a shell comment produces no output at all.
+            await ws.send(json.dumps({"type": "input", "data": f"# {echo_marker}\n"}))
+            echoed, reason = await drain_frames(ws, [echo_marker], 8)
+            if reason is not None:
+                record(name, False, f"服务端控制帧报错：{reason}")
+                return
+            echo_seen = any(echo_marker in line for line in visible_lines(echoed))
+
+            # 2. execution channel: only the shell can compute the sum.
+            await ws.send(json.dumps({"type": "input", "data": command + "\n"}))
+            output, reason = await drain_frames(ws, [total], 15)
+            if reason is not None:
+                record(name, False, f"服务端控制帧报错：{reason}")
+                return
+            lines = visible_lines(output)
+            executed = total in lines
+            tail = lines[-1][:40] if lines else "<无输出>"
+            record(name, echo_seen and executed,
+                   f"echo 通道={'live' if echo_seen else 'missing'}，"
+                   f"执行结果行 {total}={'yes' if executed else 'no'}"
+                   f"（末行 {tail!r}）")
     except Exception as e:
-        record("WS /ws/exec (interactive terminal)", False, repr(e))
+        record(name, False, repr(e))
 
 
 async def test_ws_exec_resize(cid):
@@ -259,12 +463,17 @@ async def test_ws_exec_resize(cid):
             # `stty size` prints "<rows> <cols>" as the kernel sees it.
             await ws.send(json.dumps({"type": "input", "data": "stty size\n"}))
             collected = ""
-            deadline = asyncio.get_event_loop().time() + 15
-            while asyncio.get_event_loop().time() < deadline:
+            deadline = time.monotonic() + 15
+            while time.monotonic() < deadline:
                 try:
                     chunk = await asyncio.wait_for(ws.recv(), timeout=3)
                 except asyncio.TimeoutError:
                     break
+                reason = control_frame_error(chunk)
+                if reason is not None:
+                    record("WS /ws/exec PTY resize", False,
+                           f"服务端控制帧报错：{reason}")
+                    return
                 collected += chunk
                 if "43 132" in collected:
                     break
@@ -318,9 +527,14 @@ def test_run_container():
         record("Created container is running", info.get("state") == "running",
                f"state={info.get('state')}")
 
-        if info.get("ports"):
-            record("Created container published its port", "->" in info["ports"],
-                   info["ports"])
+        # Asserted unconditionally: a conditional assert would silently drop
+        # this check from the total instead of failing loudly.
+        ports = (info.get("ports") or "").strip()
+        if ports:
+            record("Created container published its port", "->" in ports, ports)
+        else:
+            record("Created container published its port", False,
+                   "ports 为空，但创建时显式请求了 ports=80：端口映射未生效")
     except Exception as e:
         record("Run container from image", False, repr(e))
     finally:
@@ -348,10 +562,37 @@ def test_run_container_validation():
 
 
 # ---------------------------------------------------------------- main ----
-def main():
+# The full suite is expected to report exactly this many checks. A smaller
+# count means a check silently disappeared (the C-11 defect), which must fail
+# the run just like a red check does.
+EXPECTED_CHECKS = 18
+
+
+def summarize() -> int:
+    """Print the report and return the process exit code."""
+    print("\n" + "=" * 70)
+    passed = sum(1 for _, ok, _ in RESULTS if ok)
+    total = len(RESULTS)
+    print(f"RESULT: {passed}/{total} passed")
+    for name, ok, detail in RESULTS:
+        if not ok:
+            print(f"  FAILED: {name} -- {detail}")
+    complete = total == EXPECTED_CHECKS
+    if not complete:
+        print(f"  FAILED: 检查项数量 {total} != 预期 {EXPECTED_CHECKS}"
+              "（有检查被静默跳过）")
+    if total == 0:
+        print("  FAILED: 没有任何检查被执行")
+    print("=" * 70)
+    return 0 if (complete and passed == total) else 1
+
+
+def main() -> int:
     print("=" * 70)
     print("docker-manager E2E verification against live deployment")
     print("=" * 70)
+    if websockets is None:
+        print(f"!! {DEPENDENCY_HINT}（WebSocket 相关检查会直接判 FAIL）")
 
     test_health()
     containers = test_containers()
@@ -365,7 +606,9 @@ def main():
         target = containers[0] if containers else None
     if not target:
         print("!! no container available for interactive tests")
-        return
+        record("Interactive tests need a container", False,
+               "no container available for interactive tests")
+        return summarize()
     cid = target["id"]
     print(f"\n-- using target container: {target['name']} ({cid[:12]}) --\n")
 
@@ -382,15 +625,8 @@ def main():
 
     test_image_remove(image_ref)
 
-    print("\n" + "=" * 70)
-    passed = sum(1 for _, ok, _ in RESULTS if ok)
-    total = len(RESULTS)
-    print(f"RESULT: {passed}/{total} passed")
-    for name, ok, detail in RESULTS:
-        if not ok:
-            print(f"  FAILED: {name} -- {detail}")
-    print("=" * 70)
+    return summarize()
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

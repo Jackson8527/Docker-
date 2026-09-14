@@ -1,0 +1,22 @@
+# 验证脚本的运行依赖（scripts/ 下的 E2E 与 UI 校验脚本）
+#
+# 安装：
+#     pip install -r scripts/requirements-verify.txt
+#
+# 本机的 .browser-tools venv 由 uv 创建、不含 pip，若要用它跑 playwright：
+#     uv pip install --python .browser-tools\Scripts\python.exe -r scripts/requirements-verify.txt
+#
+# 说明：这些依赖以前只靠本机 .browser-tools venv（已被 .gitignore 忽略）
+# 或 uvicorn[standard] 的传递依赖碰巧存在，换台机器就会 ImportError。
+# 版本下限为下限约束，不是精确锁定。
+#
+# 需要 Python >= 3.10（脚本使用 `list[str]` 等现代注解语法）。
+
+# scripts/ui_verify.py、scripts/ui_clipboard_test.py
+# 驱动本机已安装的 Chrome（channel="chrome"），无需下载浏览器。
+# 本机实测版本：1.62.0
+playwright>=1.40
+
+# scripts/e2e_verify.py 的 WebSocket 检查（/ws/logs、/ws/exec）。
+# 不要再依赖 uvicorn[standard] 顺带装上的那个（本机实测版本：17.1）。
+websockets>=12.0

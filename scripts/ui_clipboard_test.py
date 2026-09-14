@@ -6,12 +6,23 @@ events, so this is fully verifiable in automation.
 
 Runs HEADED: headless Chrome does not bridge the system clipboard.
 
+    pip install -r scripts/requirements-verify.txt
+    python scripts/ui_clipboard_test.py
+
+On this machine the .browser-tools venv already has playwright:
+
     .browser-tools\\Scripts\\python.exe scripts\\ui_clipboard_test.py
 """
 import sys
 from pathlib import Path
 
-from playwright.sync_api import sync_playwright
+try:
+    from playwright.sync_api import sync_playwright
+except ImportError as exc:  # pragma: no cover - depends on the interpreter
+    print("缺少依赖 playwright，无法驱动浏览器做剪贴板验证。")
+    print(f"  原始错误：{exc}")
+    print("请先安装验证依赖：pip install -r scripts/requirements-verify.txt")
+    sys.exit(2)
 
 BASE = "http://127.0.0.1:8088"
 OUT = Path(__file__).resolve().parent / "ui-shots"
