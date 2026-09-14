@@ -80,7 +80,7 @@
 
 | 场景 | 数据流 |
 |------|--------|
-| 容器 列表/详情 / 创建（从镜像运行）/ 启停 / 暂停 / 删除 | HTTP → FastAPI router → docker-py → Docker daemon → 返回模型化 JSON |
+| 容器 CRUD / 启停 / 删除 | HTTP → FastAPI router → docker-py → Docker daemon → 返回模型化 JSON |
 | 拉取镜像 | HTTP POST /images/pull → docker-py `pull()`（异步/流进进出） |
 | 实时日志 | 前端 WS → `/ws/logs` → docker-py logs(stream=True) → 逐行前向 |
 | 交互终端 | 前端 xterm.js → `/ws/exec` → docker exec tty 双向 stdin/stdout |
@@ -128,5 +128,3 @@
 - 多宿主机接入（P1）
 - 镜像导入 docker load（v1.1）
 - 容器参数细节查看/启动配置编辑（v1.1）
-
-> **澄清（2026-09-11 Phase 4.6 审查回写）**：「从镜像运行容器」——自由文本解析端口/环境变量/挂载/命令/重启策略 + 常用镜像预设——**属于 v1 范围**（见 `scope.md` F12 与 `README.md` 的 R4 轮）。本节排除的仅是 v1.1 的「参数细节查看 / 启动配置编辑」。此前「§4 容器 CRUD」与本节曾被读作互相矛盾（一方说做、一方说不做），以本澄清为准。

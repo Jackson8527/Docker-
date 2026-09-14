@@ -23,7 +23,7 @@
 - 端口、环境变量、挂载、重启策略全部可在界面配置
 
 **镜像**
-- 列表（含标签、大小、创建时间）
+- 列表（含标签与镜像 ID）
 - 拉取（**Docker Hub 不可达时自动走镜像源降级**）
 - 导出为 tar 文件下载
 - 删除
@@ -179,7 +179,7 @@ docker-manager/
 │   │       ├── docker.py       # docker-py 客户端封装与数据类型
 │   │       ├── files.py        # tar 打包解包、临时目录
 │   │       └── run_spec.py     # 「自由文本 → docker-py 参数」解析器
-│   ├── tests/                  # 66 个 pytest 用例
+│   ├── tests/                  # 137 个 pytest 用例
 │   ├── Dockerfile              # uv 构建
 │   └── pyproject.toml
 ├── frontend/                   # Vue 3 前端
@@ -204,7 +204,7 @@ docker-manager/
     └── epics/docker-manager-v1/  # CDM 需求 / 设计 / 演进日志
 ```
 
-规模：后端 Python ~1.7k 行，前端 TS/Vue ~2.1k 行。
+规模：后端 Python ~1.3k 行，前端 TS/Vue ~3.2k 行。
 
 ---
 
@@ -231,7 +231,10 @@ npm run dev                         # Vite 开发服务器，/api 与 /ws 代理
 ### 测试与验证
 
 ```bash
-# 后端单元测试（66 个）
+# 验证脚本自己的依赖（playwright、websockets）；缺依赖时脚本会给出中文提示
+pip install -r scripts/requirements-verify.txt
+
+# 后端单元测试
 cd backend && uv run pytest -q
 
 # 端到端（需要真实 Docker 在跑，会真实创建/删除容器）

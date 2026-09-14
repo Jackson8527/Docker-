@@ -87,7 +87,7 @@ src/
 
 ## 4. 测试
 
-### 后端单元测试（66 个）
+### 后端单元测试（137 个）
 
 ```bash
 cd backend
@@ -126,6 +126,8 @@ monkeypatch.setattr(docker_mod, "get_docker_client", lambda: _Client())
 ### 端到端
 
 ```bash
+# 先装验证脚本自己的依赖（playwright、websockets）；缺依赖时脚本会给中文提示
+pip install -r scripts/requirements-verify.txt
 python scripts/e2e_verify.py     # 18 项，需要真实 Docker
 ```
 
@@ -155,7 +157,7 @@ python scripts/ui_clipboard_test.py  # 终端复制粘贴回归
 
 `container.logs(follow=True)` 是**阻塞生成器**。直接在 async 函数里迭代，整个服务会卡死（不只是这个连接）。
 
-正确做法：丢到工作线程里跑，用 `run_coroutine_threadsafe` 把结果送回来。
+正确做法：丢到工作线程里跑，用 `loop.call_soon_threadsafe` 把结果送回事件循环。（是 `call_soon_threadsafe` 而非 `run_coroutine_threadsafe`——回投的是一个普通回调，不是协程。）
 
 **② 交互式终端必须显式开 stdin + tty**
 

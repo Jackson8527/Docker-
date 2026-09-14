@@ -165,7 +165,17 @@ proxy_set_header Connection "upgrade";
 
 **根因**：`container.logs(follow=True)` 是**阻塞生成器**，直接在 async 函数里迭代会冻死事件循环——影响的是整个服务，不只是这个连接。
 
-**已修复**：放到工作线程里跑，用 `run_coroutine_threadsafe` 把数据送回事件循环。
+**已修复**：整条「建立日志流 + 迭代行」都放到工作线程里跑，用 `loop.call_soon_threadsafe` 把数据送回事件循环（回投的是普通回调，所以不是 `run_coroutine_threadsafe`）。注意 `cont.logs(...)` **这个建立调用本身也是阻塞的**（docker-py 在调用线程上就发 HTTP + `_check_is_tty` 的同步 inspect）——只把迭代搬进线程是不够的，实测仍会冻结服务 **1.5 秒**（审查发现 RD3-02）。
+
+### 日志里每个字符各占一行
+
+**根因**：容器以 **TTY** 模式创建时（`docker run -t`，或镜像自带 `Tty: true`），Docker 的日志流不是按行分帧的原始字节流，docker-py 对 TTY 容器走 `chunk_size=1` 的读取路径 → 平台按「一个数据块＝一行」渲染，于是 `hello` 变成 `h`/`e`/`l`/`l`/`o` 各占一行。
+
+**影响范围**：本平台自己创建的容器不设 TTY，所以只有**从命令行带 `-t` 创建、再回到本平台看日志**的容器会这样。**终端**功能不受影响（终端走 `/ws/exec` 的 PTY 原始字节流，本来就不按行解析）。
+
+**规避**：重建容器时不要加 `-t`（用 `docker run -d`），或直接在命令行 `docker logs` 看。
+
+> **已知限制，本轮未修**：修它需要给日志流换一套「按字节透传」的协议，而前端是按 `\n` 切分的——属跨层契约变更，改动面大于收益。见 `test-review/rd3/review-consolidated.md` RD3-03。
 
 ---
 
@@ -183,7 +193,14 @@ docker compose logs -f frontend
 
 ### 构建时拉基础镜像失败
 
-`python:3.12-slim`、`node:20-alpine`、`nginx:alpine`、`ghcr.io/astral-sh/uv` 都要从网上拉。构建阶段的镜像源由 **Docker daemon** 决定，和应用内的 `IMAGE_MIRRORS` 无关。
+`python:3.12-slim`、`node:20-alpine`、`nginx:alpine` 都要从网上拉；后端还会从 **PyPI** 安装 uv（`backend/Dockerfile`，**已不再依赖 `ghcr.io`**——实测守护进程拉 ghcr.io 的 token 端点会 TLS 握手超时，导致整个 `--build` 失败）。构建阶段的外网访问由 **Docker daemon** 决定，和应用内的 `IMAGE_MIRRORS` 无关。
+
+若守护进程到 PyPI 也不通或很慢，覆盖索引重建后端（注意用 `=` 传参）：
+
+```bash
+docker compose -f deploy/docker-compose.yml build \
+  --build-arg PIP_INDEX_URL=https://pypi.tuna.tsinghua.edu.cn/simple backend
+```
 
 配置 daemon 级镜像源（`/etc/docker/daemon.json`）：
 
@@ -216,6 +233,47 @@ docker compose exec frontend wget -qO- http://backend:8088/api/health
 不通就是两个容器不在同一网络，或 backend 没起来。
 
 **注意**：`deploy/docker-compose.yml` 里 backend 用的是 `expose` 而不是 `ports`，这是**故意的**——后端不对外暴露，唯一入口是 nginx。
+
+### 写操作全报 403（`cross-site request rejected`）/ 终端连不上
+
+**根因**：平台自带的防 CSRF 跨站守卫只放行「同站」写请求——它比对浏览器发来的 `Origin` 与本次请求的 `Host` 是否同源。如果你在**前面加了一层反向代理**（nginx / Apache / Caddy / Traefik…）且它**改写了 `Host` 头**（改成 `backend:8088`、或固定成自己的域名），浏览器的 `Origin` 就永远对不上：
+
+- 所有 `POST/PUT/PATCH/DELETE` → **403** `cross-site request rejected (Origin not allowed)`；
+- 终端与日志的 WebSocket（`/ws/exec`、`/ws/logs`）→ 被拒，关闭码 **1008**。
+
+**修**：让反代**保留原始 Host**。
+
+```nginx
+location / {
+    proxy_pass http://127.0.0.1:8088;
+    proxy_set_header Host $http_host;        # 必须保留端口与原始域名，别写成 $host
+    proxy_set_header X-Forwarded-Proto $scheme;
+    proxy_http_version 1.1;                  # WS 必需
+    proxy_set_header Upgrade $http_upgrade;
+    proxy_set_header Connection "upgrade";
+}
+```
+
+Apache 用 `ProxyPreserveHost On`。
+
+**安全含义（别误解）**：这条守卫是**防跨站写操作**，不是身份认证，替代不了访问控制。平台没有登录，能打开页面的人就等于拿到宿主机 root 等价权限（见 `deployment.md` 第 5 节）；远程访问请用 SSH 隧道，或用自带认证的反代。
+
+### 登录/刷新后跳到 80 端口，或子路径打开是 404
+
+**根因**：后端对带尾斜杠的 `/api/xxx/` 返回 **307**，`Location` 由 nginx 依据 `Host` 头拼出。若 nginx 写的是 `proxy_set_header Host $host;`，**端口会被丢掉** → 浏览器被送到 `http://你的域名/api/xxx`（80 端口）而不是 `http://你的域名:8088/api/xxx`。
+
+**修**：`frontend/nginx.conf` 里 `/api` 与 `/ws` 两处都用 `$http_host`（保留端口）：
+
+```nginx
+proxy_set_header Host $http_host;
+```
+
+改完重建前端容器生效（`docker compose up -d --build frontend`）。自测：
+
+```bash
+curl -sI http://127.0.0.1:8088/api/containers/ | findstr /i location
+# 期望：location: http://127.0.0.1:8088/api/containers    ← 端口必须在
+```
 
 ---
 
@@ -262,6 +320,7 @@ docker info | head -30
 再跑一遍自动化验证，它会明确指出是哪一层出问题：
 
 ```bash
+pip install -r scripts/requirements-verify.txt   # 验证脚本自己的依赖（playwright、websockets）
 python scripts/e2e_verify.py     # 后端 + Docker 层
 python scripts/ui_verify.py      # 浏览器层（含页面报错）
 ```

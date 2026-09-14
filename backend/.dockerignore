@@ -1,0 +1,17 @@
+# The build context is ../backend (see deploy/docker-compose.yml) and the
+# Dockerfile only needs pyproject.toml, uv.lock and app/.
+.venv
+__pycache__
+*.py[cod]
+.pytest_cache
+pytest-cache-files-*
+tests
+_staging
+.env
+*.log
+
+# Editor / OS noise
+.DS_Store
+Thumbs.db
+.idea
+.vscode

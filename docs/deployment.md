@@ -31,7 +31,7 @@
 | 项 | 要求 |
 |----|------|
 | Docker Engine | 20.10+ |
-| Docker Compose | v2（`docker compose`，带连字符的 `docker-compose` 不支持） |
+| Docker Compose | v2（`docker compose`）。v1 的 `docker-compose` 已 EOL，**未做兼容性验证**；本文命令与语法一律以 v2 为准 |
 | 权限 | 当前用户能访问 `docker.sock`（在 `docker` 组内，或 root） |
 | 磁盘 | ≥ 2 GB（基础镜像 + 构建缓存）；若要拉大镜像另算 |
 | 网络 | 能访问 Docker Hub 或已配置镜像源 |
@@ -101,19 +101,37 @@ cp ../.env.example .env
 2. 失败且判定为「仓库不可达」时，按顺序对每个镜像源重试；
 3. 成功后**自动打回原始标签**（`mysql:latest`），并删掉临时标签。
 
-所以拉完之后 `docker images` 里看到的仍是正常名字。想关闭降级：
+所以拉完之后 `docker images` 里看到的仍是正常名字。
 
-```yaml
-- IMAGE_MIRRORS=
+镜像源用环境变量配置，写进 **`deploy/.env`**（与 `docker-compose.yml` 同目录；**根目录的 `.env` 不会被 compose 读取**）。注意 `.env` 是「键=值」格式，**不要写 YAML 的列表横线**——写成 `- IMAGE_MIRRORS=` 会让 compose 直接拒绝启动（`key cannot contain a space`）。
+
+想关闭降级（留空即保持空值，后端判定为「无镜像源」）：
+
+```bash
+IMAGE_MIRRORS=
 ```
 
 想换成自己的私有仓库：
 
-```yaml
-- IMAGE_MIRRORS=harbor.example.com,mirror.aliyuncs.com
+```bash
+IMAGE_MIRRORS=harbor.example.com,mirror.aliyuncs.com
 ```
 
+> 这里必须用单横线形式 `${IMAGE_MIRRORS-…}`（`docker-compose.yml` 已是此写法）：若用 `${IMAGE_MIRRORS:-…}`，compose 会把「留空」当成「未设置」而套回默认镜像源，上面这种「留空关闭降级」就会失效。
+
 > 私有仓库需带完整路径前缀（如 `harbor.example.com/library`），后端只做「把仓库域名插到镜像名前」这一件事。
+
+**关于构建时的外网依赖**
+
+`backend/Dockerfile` 用 **PyPI** 安装 uv（不再 `FROM ghcr.io/astral-sh/uv`）。原因：受限网络下 ghcr.io 的 token 端点可能 TLS 握手超时，会让整个 `up -d --build` 在第一步就失败，而 PyPI 通常可达。构建阶段的外网访问由 **Docker 守护进程**决定，和应用内的 `IMAGE_MIRRORS` 无关。
+
+- 正常网络：`docker compose -f deploy/docker-compose.yml up -d --build` 直接可用。
+- PyPI 慢或不通：覆盖索引即可（注意用 `=` 传参）：
+  ```bash
+  docker compose -f deploy/docker-compose.yml build \
+    --build-arg PIP_INDEX_URL=https://pypi.tuna.tsinghua.edu.cn/simple backend
+  ```
+- uv 版本钉在 `backend/Dockerfile` 的 `ARG UV_VERSION`（当前 `0.12.0`）。
 
 ### 4.3 换监听地址 / 端口
 
@@ -150,6 +168,16 @@ ssh -L 8088:127.0.0.1:8088 user@your-server
 然后在本机浏览器打开 `http://127.0.0.1:8088`。
 
 **绝对不要**直接把端口暴露到公网。如果确实需要，必须自己在前置加一层带认证和 HTTPS 的反向代理。
+
+> **自建反向代理的前提**：后端带着**跨站请求守卫**（`backend/app/services/security.py`）。浏览器发来的 `POST/PUT/PATCH/DELETE` 与 `/ws/*` 握手，若 `Origin` 的 host 既不是 `localhost`/`127.0.0.1`/`::1`，也不等于**这次请求的 `Host`**，就会被 **HTTP 403 / WS 1008** 拒绝（不带 `Origin` 的非浏览器客户端不受影响，例如 curl 与验证脚本）。
+>
+> 所以自己加反代时**必须保留客户端的 Host 头**：
+>
+> ```nginx
+> proxy_set_header Host $http_host;   # 用 $http_host，$host 会丢掉端口号
+> ```
+>
+> Apache 的 `ProxyPreserveHost` 默认为 `Off`，需显式 `ProxyPreserveHost On`，否则所有写操作都会被 403。若确实要用另一个域名访问，请把该域名加入守卫（`security.py` 的判定），不要绕成「只要不带 Origin 就放行」。
 
 ---
 
@@ -230,6 +258,7 @@ docker compose exec backend uv run python -c \
 自动化验证（需要真实 Docker）：
 
 ```bash
+pip install -r scripts/requirements-verify.txt   # 验证脚本自己的依赖（playwright、websockets）
 python scripts/e2e_verify.py        # 18 项端到端，含创建/删除真实容器
 python scripts/ui_verify.py         # 浏览器逐页截图 + 报错收集
 ```
