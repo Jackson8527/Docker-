@@ -21,7 +21,10 @@ def list_volumes():
 
 
 @router.post("")
-def create_volume(name: str = Body(...)):
+def create_volume(name: str = Body(..., embed=True)):
+    # embed=True is REQUIRED: the client posts {"name": "..."}. Without it FastAPI
+    # treats the single scalar Body param as the whole body (a bare JSON string)
+    # and every request from the UI fails with 422 string_type.
     try:
         get_docker_client().volumes.create(name)
         return {"ok": True}

@@ -96,7 +96,11 @@ def pull_mirrors():
 def save_image(iid: str):
     try:
         img = get_docker_client().images.get(iid)
-        return StreamingResponse(img.save(), media_type="application/x-tar")
+        # named=True keeps repository:tag in the tarball. docker-py defaults to
+        # named=False, which makes `docker load` on another host produce
+        # <none>:<none> - the image loses its name and the export stops being a
+        # usable archive.
+        return StreamingResponse(img.save(named=True), media_type="application/x-tar")
     except Exception as e:
         raise HTTPException(500, extract_error(e))
 
