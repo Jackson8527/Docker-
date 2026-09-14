@@ -1,0 +1,84 @@
+/**
+ * Shared client side of the frozen websocket protocol (backend/app/routers/ws.py).
+ *
+ * Two rules live here because both `/ws/logs` and `/ws/exec` depend on them and
+ * getting either wrong is silent - a wrong guess either renders a protocol
+ * frame as log output or reconnects forever against a target that will never
+ * answer.
+ */
+
+/**
+ * Read a server-sent error frame, e.g.
+ * `{"dockermgr": "error", "error": "no such container: web"}`.
+ *
+ * `/ws/logs` and `/ws/exec` send exactly one such text frame before closing
+ * when they cannot serve the request.
+ *
+ * The frame carries a discriminant (`"dockermgr": "error"`) and the test keys
+ * off it, not off the shape of the payload: a container is free to print a
+ * single-line JSON log such as
+ * `{"level":"error","error":"ECONNREFUSED","msg":"upstream"}` - the default
+ * error shape of most structured loggers - and that line must still reach the
+ * log view. Requiring both the discriminant and a non-empty `error` string
+ * keeps the two apart without guessing.
+ *
+ * Ordinary output is therefore never misread as an error: a batched log frame
+ * (many lines joined with `\n`) does not parse as JSON at all, and a JSON line
+ * without the discriminant is data whatever it contains.
+ *
+ * Must stay in sync with the backend (`backend/app/routers/ws.py`) and with
+ * `scripts/e2e_verify.py`'s frame sniffer.
+ *
+ * @returns the reason to show the user, or `null` when the frame is data.
+ */
+export function parseServerErrorFrame(raw: string): string | null {
+  const text = raw.trim()
+  // Cheap reject before paying for JSON.parse on every log batch.
+  if (!text.startsWith('{') || !text.endsWith('}')) return null
+
+  let parsed: unknown
+  try {
+    parsed = JSON.parse(text)
+  } catch {
+    return null
+  }
+  if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return null
+
+  const frame = parsed as { dockermgr?: unknown; error?: unknown }
+  if (frame.dockermgr !== 'error') return null
+
+  const reason = frame.error
+  return typeof reason === 'string' && reason.trim() ? reason : null
+}
+
+/**
+ * Should a closed socket be retried with backoff?
+ *
+ * `1000` (normal closure) means the backend finished on purpose: the log stream
+ * ended because the container stopped, or it sent an error frame first.
+ * Reconnecting would replay the same tail forever (or hammer a target that no
+ * longer exists). `1008` (policy violation) is the cross-site-origin rejection
+ * in `ws.py`, which a retry would hit identically.
+ *
+ * Everything else is treated as a dropped connection worth retrying - most
+ * importantly `1006`, the code a browser reports when the transport dies
+ * without a close handshake, plus `1001` (server going away) and `1011`.
+ */
+export function isRetryableClose(code: number): boolean {
+  return code !== 1000 && code !== 1008
+}
+
+/**
+ * Put a backend reason into words the user can act on.
+ *
+ * The important distinction is "the container does not exist" versus "the
+ * connection failed": the first means retrying and editing the name are
+ * pointless, the second is usually transient. `no container` is what
+ * `/ws/logs` sends, `no such container: <name>` what `/ws/exec` sends.
+ */
+export function describeWsError(reason: string): string {
+  if (/no such container|no container/i.test(reason)) {
+    return `${reason} —— 容器可能已被删除或改名，请刷新列表后重试。`
+  }
+  return reason
+}

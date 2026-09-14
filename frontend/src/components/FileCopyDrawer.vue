@@ -55,7 +55,9 @@
         <el-input v-model="srcPath" placeholder="/app/logs" />
       </div>
 
-      <el-button type="success" class="copy-submit" @click="download">下载</el-button>
+      <el-button type="success" class="copy-submit" :loading="downloading" @click="download">
+        下载
+      </el-button>
     </section>
   </div>
 </template>
@@ -66,6 +68,7 @@ import { ElMessage } from 'element-plus'
 import { UploadFilled, Download } from '@element-plus/icons-vue'
 import type { UploadFile, UploadFiles } from 'element-plus'
 import axios from 'axios'
+import { startDownload } from '../utils/download'
 
 const props = defineProps<{ cid: string }>()
 
@@ -74,6 +77,7 @@ const srcPath = ref('/')
 const file = ref<File | null>(null)
 const fileList = ref<UploadFiles>([])
 const uploading = ref(false)
+const downloading = ref(false)
 
 function onFileChange(uploadFile: UploadFile, uploadFiles: UploadFiles) {
   // el-upload keeps every selection; only the newest one is copied.
@@ -106,16 +110,22 @@ async function upload() {
   }
 }
 
-function download() {
+async function download() {
   if (!srcPath.value) {
     ElMessage.warning('请填写容器内路径')
     return
   }
-  const a = document.createElement('a')
-  a.href = `/api/containers/${props.cid}/copy?path=${encodeURIComponent(srcPath.value)}`
-  a.download = 'container-file.tar'
-  a.click()
-  ElMessage.success('已开始下载')
+  const url = `/api/containers/${props.cid}/copy?path=${encodeURIComponent(srcPath.value)}`
+  downloading.value = true
+  try {
+    // Preflight first: a bare <a href> reports nothing, so a 500 (path missing,
+    // container gone) used to surface as "已开始下载" plus a JSON error page.
+    if (await startDownload(url, 'container-file.tar')) {
+      ElMessage.success('已开始下载')
+    }
+  } finally {
+    downloading.value = false
+  }
 }
 </script>
 

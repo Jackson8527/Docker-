@@ -60,14 +60,14 @@
           </template>
         </el-table-column>
 
-        <el-table-column label="操作" width="270" align="right" fixed="right">
+        <el-table-column label="操作" width="326" align="right" fixed="right">
           <template #default="{ row }">
             <div class="dm-row-actions">
               <el-button
                 size="small"
                 type="success"
                 plain
-                :disabled="row.state === 'running'"
+                :disabled="isBusy(row) || row.state === 'running'"
                 @click="act('start', row)"
               >
                 启动
@@ -76,19 +76,62 @@
                 size="small"
                 type="warning"
                 plain
-                :disabled="row.state !== 'running'"
+                :disabled="isBusy(row) || row.state !== 'running'"
                 @click="act('stop', row)"
               >
                 停止
               </el-button>
-              <el-button size="small" plain @click="act('restart', row)">重启</el-button>
+
+              <!-- Pause is only meaningful while running, and unpause only
+                   while paused; Docker rejects both other combinations, so the
+                   two states share one slot instead of two dead buttons. -->
+              <el-button
+                v-if="row.state === 'running'"
+                size="small"
+                type="info"
+                plain
+                :loading="isActing(row, 'pause')"
+                :disabled="isBusy(row)"
+                @click="act('pause', row)"
+              >
+                暂停
+              </el-button>
+              <el-button
+                v-else-if="row.state === 'paused'"
+                size="small"
+                type="info"
+                plain
+                :loading="isActing(row, 'unpause')"
+                :disabled="isBusy(row)"
+                @click="act('unpause', row)"
+              >
+                恢复
+              </el-button>
+
+              <el-button size="small" plain :disabled="isBusy(row)" @click="act('restart', row)">
+                重启
+              </el-button>
 
               <el-dropdown trigger="click" @command="(cmd: string) => onMenu(cmd, row)">
                 <el-button size="small" plain :icon="MoreFilled" />
                 <template #dropdown>
                   <el-dropdown-menu>
                     <el-dropdown-item command="logs" :icon="Document">查看日志</el-dropdown-item>
-                    <el-dropdown-item command="terminal" :icon="Monitor">进入终端</el-dropdown-item>
+                    <!-- 进入终端 needs a live process: Docker's `exec_create`
+                         blocks forever on a paused (frozen) container, so the
+                         drawer would sit at 「连接中…」 with a stuck backend
+                         thread. 查看日志 / 文件拷贝 stay enabled - they read the
+                         log buffer and the filesystem, not the process. -->
+                    <el-dropdown-item
+                      command="terminal"
+                      :icon="Monitor"
+                      :disabled="!canOpenTerminal(row)"
+                    >
+                      <!-- tooltip on a plain element: el-dropdown-item's own
+                           attr forwarding is not something to rely on. Kept on
+                           one line so the hint never gains a stray space. -->
+                      <span :title="terminalHint(row)" class="c-menu-label">进入终端<span v-if="terminalHint(row)" class="c-menu-hint">（{{ terminalHint(row) }}）</span></span>
+                    </el-dropdown-item>
                     <el-dropdown-item command="copy" :icon="FolderOpened">文件拷贝</el-dropdown-item>
                     <el-dropdown-item command="commit" :icon="Box" divided>打包为镜像</el-dropdown-item>
                     <el-dropdown-item command="remove" :icon="Delete" divided>删除容器</el-dropdown-item>
@@ -242,14 +285,75 @@ async function load() {
   }
 }
 
-async function act(type: 'start' | 'stop' | 'restart', row: ContainerRow) {
+/** Actions that take a single container id and nothing else. */
+type ContainerAction = 'start' | 'stop' | 'restart' | 'pause' | 'unpause'
+
+/** Past-tense wording for the success toast, per action. */
+const ACTION_DONE: Record<ContainerAction, string> = {
+  start: '启动',
+  stop: '停止',
+  restart: '重启',
+  pause: '暂停',
+  unpause: '恢复',
+}
+
+/**
+ * `<id>:<action>` of the operation currently in flight; `''` when idle.
+ *
+ * Operations are not instantaneous: the buttons are clickable the whole time
+ * the daemon is transitioning the container, and `load()` below is not awaited,
+ * so `row.state` still shows the old value. Clicking twice (or clicking 停止
+ * while 暂停 is still running - Docker refuses that combination) used to reach
+ * the daemon mid-transition and surface as a 500.
+ */
+const busy = ref('')
+
+function isBusy(row: ContainerRow): boolean {
+  return busy.value.startsWith(`${row.id}:`)
+}
+
+/** Drives the spinner on the one button that was actually clicked. */
+function isActing(row: ContainerRow, type: ContainerAction): boolean {
+  return busy.value === `${row.id}:${type}`
+}
+
+async function act(type: ContainerAction, row: ContainerRow) {
+  // Re-entry guard. Kept per row so a second row can still be operated on.
+  if (isBusy(row)) return
+  busy.value = `${row.id}:${type}`
   try {
     await containersApi[type](row.id)
-    ElMessage.success(`${row.name} 已${type === 'start' ? '启动' : type === 'stop' ? '停止' : '重启'}`)
+    ElMessage.success(`${row.name} 已${ACTION_DONE[type]}`)
     load()
   } catch (err) {
     fail(err)
+  } finally {
+    busy.value = ''
   }
+}
+
+/**
+ * `true` only for a running container.
+ *
+ * `exec` needs a live process, and Docker's `exec_create` on a *paused*
+ * (frozen) container never returns: the daemon blocks until it is unpaused, so
+ * the backend's `asyncio.to_thread(exec_start, ...)` (ws.py) holds a thread and
+ * the drawer sits on 「连接中…」 with nothing the user can do. A stopped
+ * container simply has no process to exec into.
+ *
+ * 查看日志 and 文件拷贝 stay enabled in those states on purpose: they read the
+ * log buffer and the container filesystem, neither of which needs the process
+ * to be running (only follow-mode on a dead container ends early, which the log
+ * view already reports as 「日志流已结束」).
+ */
+function canOpenTerminal(row: ContainerRow): boolean {
+  return row.state === 'running'
+}
+
+/** Why 进入终端 is disabled, or `''` when it is available. */
+function terminalHint(row: ContainerRow): string {
+  if (canOpenTerminal(row)) return ''
+  return row.state === 'paused' ? '容器已暂停，请先恢复' : '容器未运行，请先启动'
 }
 
 function onMenu(cmd: string, row: ContainerRow) {
@@ -360,5 +464,15 @@ onMounted(load)
   margin: 0 0 16px;
   font-size: 12px;
   color: var(--dm-text-muted);
+}
+
+/* Reason shown next to a disabled menu entry (e.g. 进入终端 on a paused
+   container). Dimmed so the entry itself still reads as the label. */
+.c-menu-label {
+  display: inline-block;
+}
+.c-menu-hint {
+  color: var(--dm-text-muted);
+  font-size: 12px;
 }
 </style>

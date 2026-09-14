@@ -61,7 +61,13 @@
               <el-button size="small" type="primary" plain :icon="VideoPlay" @click="openRun(row)">
                 运行
               </el-button>
-              <el-button size="small" plain :icon="Download" @click="exportImage(row)">
+              <el-button
+                size="small"
+                plain
+                :icon="Download"
+                :loading="exportingId === row.id"
+                @click="exportImage(row)"
+              >
                 导出
               </el-button>
               <el-button size="small" type="danger" plain :icon="Delete" @click="removeRow(row)">
@@ -90,6 +96,7 @@ import { ElMessage, ElMessageBox } from 'element-plus'
 import { Search, Refresh, Download, Delete, Picture, VideoPlay } from '@element-plus/icons-vue'
 import { imagesApi, type ImageRow } from '../api'
 import { showApiError } from '../utils/error'
+import { startDownload } from '../utils/download'
 import RunContainerDialog from '../components/RunContainerDialog.vue'
 
 const rows = ref<ImageRow[]>([])
@@ -100,6 +107,8 @@ const keyword = ref('')
 const mirrors = ref<string[]>([])
 const showRun = ref(false)
 const runImage = ref('')
+/** Image id whose export preflight is in flight; empty when idle. */
+const exportingId = ref('')
 
 const mirrorHint = computed(() =>
   mirrors.value.length
@@ -167,12 +176,19 @@ async function doPull() {
   }
 }
 
-function exportImage(row: ImageRow) {
-  const a = document.createElement('a')
-  a.href = imagesApi.saveUrl(row.id)
-  a.download = `${(row.tags?.[0] || 'image').replace(/[/:]/g, '_')}.tar`
-  a.click()
-  ElMessage.success('已开始导出')
+async function exportImage(row: ImageRow) {
+  const filename = `${(row.tags?.[0] || 'image').replace(/[/:]/g, '_')}.tar`
+  exportingId.value = row.id
+  try {
+    // Preflight first: the raw <a href> had no failure channel, so a 500 from
+    // /images/{id}/save still showed "已开始导出" and downloaded an error page.
+    // The tar itself is still fetched through the direct link (streamed, no blob).
+    if (await startDownload(imagesApi.saveUrl(row.id), filename)) {
+      ElMessage.success('已开始导出')
+    }
+  } finally {
+    exportingId.value = ''
+  }
 }
 
 async function removeRow(row: ImageRow) {

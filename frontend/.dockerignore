@@ -1,0 +1,28 @@
+# Keep the frontend build context small AND platform-independent.
+#
+# `COPY . .` runs *after* `npm ci`, so anything not listed here overwrites the
+# freshly installed Linux node_modules inside the image with whatever the host
+# happens to have - a Windows node_modules is ~116 MB, which made the context
+# 118 MB and the build non-reproducible.
+node_modules
+dist
+.vite
+
+# Build artifacts of `vue-tsc -b`. vite.config.js would also *shadow*
+# vite.config.ts inside the image, since Vite prefers the .js form.
+*.tsbuildinfo
+vite.config.js
+vite.config.d.ts
+
+# Local config / tooling output
+.env
+.env.*
+.browser-tools
+.npm-cache
+*.log
+
+# Editor / OS noise
+.DS_Store
+Thumbs.db
+.idea
+.vscode

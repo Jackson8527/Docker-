@@ -9,8 +9,20 @@
       <div class="term-actions">
         <span class="term-tip">选中文本 Ctrl+C 复制 · Ctrl+V / 右键 粘贴</span>
         <el-button size="small" :icon="Refresh" @click="reconnect">重连</el-button>
+        <el-button v-if="!userClosed" size="small" :icon="SwitchButton" @click="closeStream">
+          断开
+        </el-button>
         <el-button size="small" :icon="Brush" @click="clearScreen">清屏</el-button>
       </div>
+    </div>
+    <div v-if="notice" class="term-notice">
+      <el-alert
+        :type="notice.type"
+        :title="notice.title"
+        :description="notice.detail"
+        show-icon
+        :closable="false"
+      />
     </div>
     <div ref="hostEl" class="term-host"></div>
   </div>
@@ -19,18 +31,35 @@
 <script setup lang="ts">
 import { ref, computed, onMounted, onUnmounted, nextTick } from 'vue'
 import { ElMessage } from 'element-plus'
-import { Refresh, Brush } from '@element-plus/icons-vue'
+import { Refresh, Brush, SwitchButton } from '@element-plus/icons-vue'
 import { Terminal } from '@xterm/xterm'
 import { FitAddon } from '@xterm/addon-fit'
 import '@xterm/xterm/css/xterm.css'
+import { describeWsError, isRetryableClose, parseServerErrorFrame } from '../utils/ws'
 
 const props = defineProps<{ cid: string }>()
 defineEmits<{ (e: 'close'): void }>()
+
+const RETRY_BASE = 1000
+const RETRY_MAX = 30000
+/** ~1 frame: PTY output is written to xterm once per frame at most. */
+const WRITE_FLUSH_INTERVAL = 16
+
+interface Notice {
+  type: 'error' | 'warning' | 'info'
+  title: string
+  detail: string
+}
 
 const hostEl = ref<HTMLDivElement>()
 const status = ref<'connecting' | 'connected' | 'closed'>('connecting')
 const cols = ref(0)
 const rows = ref(0)
+const notice = ref<Notice | null>(null)
+/** Seconds until the next automatic attempt; 0 when none is pending. */
+const retryIn = ref(0)
+/** Set by the 「断开」button; suppresses automatic reconnects until 「重连」. */
+const userClosed = ref(false)
 
 let term: Terminal | null = null
 let fitAddon: FitAddon | null = null
@@ -38,10 +67,20 @@ let ws: WebSocket | null = null
 let observer: ResizeObserver | null = null
 let disposed = false
 let pending: string[] = []
+/** Set when the server answered with an error frame instead of a session. */
+let serverRefused = false
+/** PTY bytes waiting for the next xterm write. */
+let writeBuf = ''
+let writeTimer: number | undefined
+let tickTimer: number | undefined
+let retryDelay = RETRY_BASE
+let retryAt = 0
 
-const statusText = computed(
-  () => ({ connecting: '连接中…', connected: '已连接', closed: '会话已结束' })[status.value]
-)
+const statusText = computed(() => {
+  if (userClosed.value) return '已断开（手动）'
+  if (retryIn.value > 0) return `连接已断开 · ${retryIn.value}s 后重连`
+  return { connecting: '连接中…', connected: '已连接', closed: '会话已结束' }[status.value]
+})
 const statusClass = computed(() => `is-${status.value}`)
 
 function wsUrl(path: string) {
@@ -193,39 +232,173 @@ function connect() {
   status.value = 'connecting'
   cols.value = 0
   rows.value = 0
+  notice.value = null
+  serverRefused = false
 
   ws = new WebSocket(wsUrl(`/ws/exec?container=${encodeURIComponent(props.cid)}`))
 
   ws.onopen = () => {
     if (disposed) return
     status.value = 'connected'
+    // The socket reached the backend, so the target is up: restart the backoff
+    // from the base delay. Without this, N failures pin the delay at RETRY_MAX
+    // for the rest of the session - a later drop would cost the user 30s even
+    // after hours of healthy streaming.
+    retryDelay = RETRY_BASE
     flushPending()
     scheduleFit()
     term?.focus()
   }
   ws.onmessage = (e) => {
-    if (!disposed && term) term.write(e.data as string)
+    if (disposed) return
+    const chunk = typeof e.data === 'string' ? e.data : ''
+    const reason = parseServerErrorFrame(chunk)
+    if (reason !== null) {
+      // Protocol frame (`{"dockermgr":"error",...}`), not PTY output: /ws/exec
+      // answers an unknown container with a single error frame before closing.
+      // Writing it to xterm would garble the screen instead of telling the user
+      // what went wrong; the discriminant check lives in utils/ws.ts.
+      serverRefused = true
+      notice.value = { type: 'error', title: '无法打开终端', detail: describeWsError(reason) }
+      return
+    }
+    queueWrite(chunk)
   }
-  ws.onclose = () => {
+  ws.onclose = (ev) => {
     if (disposed) return
     status.value = 'closed'
-    term?.write('\r\n\x1b[38;5;244m[会话已结束]\x1b[0m\r\n')
+    // Never lose the tail of a session that just ended.
+    flushWrite()
+    if (!serverRefused) {
+      if (isRetryableClose(ev.code)) {
+        // Transport died (1006 and friends): reconnect, the session is gone but
+        // there is nothing the user did wrong.
+        notice.value = {
+          type: 'error',
+          title: '连接已断开',
+          detail: '与容器的连接中断，正在自动重连…',
+        }
+      } else {
+        // Clean close: the shell exited. Retrying would silently start a *new*
+        // session, so this one is left to the user.
+        queueWrite('\r\n\x1b[38;5;244m[会话已结束]\x1b[0m\r\n')
+        notice.value = {
+          type: 'warning',
+          title: '会话已结束',
+          detail: '容器内的 shell 已退出（或后端未能建立会话）。可点「重连」开启新会话。',
+        }
+      }
+    }
+    scheduleRetry(ev.code)
   }
   ws.onerror = () => {
-    if (!disposed) status.value = 'closed'
+    // A failing socket always reports through onclose too; that is where the
+    // close code - and therefore the retry decision - is available.
   }
 }
 
-function reconnect() {
-  if (ws) {
-    ws.onclose = null
-    ws.close()
+/** Queue the next attempt, doubling the delay up to RETRY_MAX. */
+function scheduleRetry(code: number) {
+  if (disposed || userClosed.value) return
+  if (!isRetryableClose(code)) return
+
+  retryAt = Date.now() + retryDelay
+  retryIn.value = Math.ceil(retryDelay / 1000)
+  retryDelay = Math.min(retryDelay * 2, RETRY_MAX)
+  if (tickTimer === undefined) tickTimer = window.setInterval(tickRetry, 1000)
+}
+
+function tickRetry() {
+  if (disposed || userClosed.value) {
+    stopRetry()
+    return
   }
+  const left = retryAt - Date.now()
+  if (left > 0) {
+    retryIn.value = Math.ceil(left / 1000)
+    return
+  }
+  stopRetry()
+  connect()
+}
+
+function stopRetry() {
+  if (tickTimer !== undefined) {
+    window.clearInterval(tickTimer)
+    tickTimer = undefined
+  }
+  retryIn.value = 0
+  retryAt = 0
+}
+
+function dropSocket() {
+  if (!ws) return
+  // Detach first: a close handler here would schedule a retry we did not ask for.
+  ws.onopen = null
+  ws.onmessage = null
+  ws.onclose = null
+  ws.onerror = null
+  ws.close()
+  ws = null
+}
+
+/** Manual 「重连」: reset the backoff so the user does not wait out a 30s delay. */
+function reconnect() {
+  stopRetry()
+  dropSocket()
+  // Buffered output belongs to the session being dropped: discard it instead of
+  // writing it, or it could land after term.reset() and survive the reset.
+  discardWrite()
+  retryDelay = RETRY_BASE
+  userClosed.value = false
   if (term) {
     term.reset()
   }
   pending = []
   connect()
+}
+
+/** Manual 「断开」: stop the session and stay stopped. */
+function closeStream() {
+  userClosed.value = true
+  stopRetry()
+  flushWrite()
+  dropSocket()
+  status.value = 'closed'
+  notice.value = null
+}
+
+// ---------------------------------------------------------------- output --
+
+/**
+ * Buffer PTY bytes and hand them to xterm at most once per frame.
+ *
+ * xterm queues internally, but calling write() for every websocket frame still
+ * costs one parse entry per frame; a chatty command (`find /`, `tail -f`) can
+ * push thousands. Coalescing also keeps escape sequences that arrive split
+ * across frames in order - the buffer is a single string, so ordering cannot
+ * be lost.
+ */
+function queueWrite(data: string) {
+  if (disposed || !term || !data) return
+  writeBuf += data
+  if (writeTimer !== undefined) return
+  writeTimer = window.setTimeout(flushWrite, WRITE_FLUSH_INTERVAL)
+}
+
+function flushWrite() {
+  const data = writeBuf
+  discardWrite()
+  if (!disposed && term && data) term.write(data)
+}
+
+/** Drop buffered output without writing it (screen reset, teardown). */
+function discardWrite() {
+  if (writeTimer !== undefined) {
+    window.clearTimeout(writeTimer)
+    writeTimer = undefined
+  }
+  writeBuf = ''
 }
 
 onMounted(async () => {
@@ -273,15 +446,14 @@ onMounted(async () => {
 })
 
 onUnmounted(() => {
+  // Flag first, then tear down: nothing may re-arm a timer or a socket after this.
   disposed = true
+  stopRetry()
+  discardWrite()
   hostEl.value?.removeEventListener('contextmenu', onContextMenu, true)
   observer?.disconnect()
   observer = null
-  if (ws) {
-    ws.onclose = null
-    ws.onmessage = null
-    ws.close()
-  }
+  dropSocket()
   term?.dispose()
   term = null
   fitAddon = null
@@ -340,6 +512,27 @@ onUnmounted(() => {
   font-size: 11px;
   color: #64748b;
   margin-right: 4px;
+}
+
+/* The terminal chrome is dark, so the stock light alert is re-tinted. */
+.term-notice {
+  flex: none;
+  padding: 8px 12px 0;
+}
+.term-notice :deep(.el-alert) {
+  align-items: flex-start;
+  padding: 6px 10px;
+  background: #1e293b;
+  border: 1px solid #334155;
+}
+.term-notice :deep(.el-alert__title) {
+  color: #e2e8f0;
+  font-size: 12px;
+}
+.term-notice :deep(.el-alert__description) {
+  color: #94a3b8;
+  font-size: 12px;
+  margin: 2px 0 0;
 }
 
 .term-actions {
