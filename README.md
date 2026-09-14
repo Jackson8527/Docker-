@@ -272,6 +272,7 @@ python scripts/ui_clipboard_test.py
 
 | 文档 | 内容 |
 |------|------|
+| [`docs/usage.md`](docs/usage.md) | **使用手册**：界面怎么用、常见任务怎么做、每个页面逐项说明（第一次用面板先看这个） |
 | [`docs/deployment.md`](docs/deployment.md) | 部署、配置、升级、备份、安全加固 |
 | [`docs/development.md`](docs/development.md) | 本地开发、代码结构、测试约定 |
 | [`docs/troubleshooting.md`](docs/troubleshooting.md) | 已踩过的坑与解决办法 |
