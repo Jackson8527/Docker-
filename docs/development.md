@@ -81,7 +81,8 @@ src/
 **约定**：
 - 所有后端类型定义集中在 `api/index.ts`，组件不自己拼类型。
 - 后端错误统一走 `showApiError(err, title)`，不要各写各的 `ElMessage.error`。
-- 长耗时请求用 `NO_TIMEOUT`（`{ timeout: 0 }`）。**只有拉取镜像和导出镜像需要**，其他接口保持默认超时，否则后端挂掉时界面会一直转圈。
+- 长耗时请求的超时按用途分两档，都在 `api/index.ts` 里：**拉取镜像**用 `NO_TIMEOUT`（`{ timeout: 0 }`，拉多久都等，`:55,87`）；**创建容器与打包镜像（commit）**用 `LONG_OP_TIMEOUT`（`{ timeout: 300000 }`，300 秒兜底，避免守护进程卡住时界面永远转圈，`:69,73,80-81`）。其余接口保持默认 30 秒。
+- **导出镜像不走 axios**：它是 `imagesApi.saveUrl()` 拼出地址后交给 `utils/download.ts` 的 `startDownload()`——先做 30 秒 `fetch` 预检，再走裸 `<a href>` 让浏览器下载（所以既不受 axios 超时约束，也没有超时选项可配）。新增「流式下载」类功能时照这条链路走，不要再想办法塞进 axios。
 
 ---
 

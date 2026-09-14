@@ -152,8 +152,8 @@ docker compose down --rmi local   # 连同构建的镜像一起删掉
 ### WebSocket
 | 路径 | 参数 | 说明 |
 |------|------|------|
-| `/ws/logs` | `filter`（容器名）、`stream`（`stdout`/`stderr`）、`tail` | 实时日志 |
-| `/ws/exec` | `container`（容器 ID）、`cmd`（默认 `/bin/sh`） | 交互式终端 |
+| `/ws/logs` | `filter`（容器名，**前缀匹配**，优先匹配运行中的容器）、`stream`（`stdout`/`stderr`/`both`，默认 `stdout`；`both` 就是界面上的「全部」）、`tail`（返回最近多少行，默认 `100`） | 实时日志 |
+| `/ws/exec` | `container`（容器 ID 或名称）、`cmd`（默认 `/bin/sh`） | 交互式终端 |
 
 `/ws/exec` 协议：**服务端 → 客户端是原始终端字节**；**客户端 → 服务端是 JSON 控制帧**：
 
@@ -262,7 +262,7 @@ python scripts/ui_clipboard_test.py
 
 **已知限制**
 - 只监听 `127.0.0.1`。要换地址改 `deploy/docker-compose.yml` 的 `ports`。
-- 镜像删除是强删，被容器引用的镜像会被 `force` 删除。
+- **删除一律是强制删除**：容器删除与镜像删除都固定带 `force`（`docker rm -f` / `docker rmi -f`），界面上没有「是否强制」开关。因此**运行中的容器会被直接停止并删除**（不必先「停止」），**被容器引用的镜像也会被强删**（那些容器随后成为悬空引用）。确认框里会写明这个后果。
 - 文件传输走 tar，超大文件（>1GB）会占用较多内存和带宽。
 - 终端默认 shell 是 `/bin/sh`。容器里没有 `/bin/sh`（如 distroless 镜像）时无法进入终端。
 

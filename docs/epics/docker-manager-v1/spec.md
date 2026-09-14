@@ -80,7 +80,7 @@
 
 | 场景 | 数据流 |
 |------|--------|
-| 容器 列表/详情 / 创建（从镜像运行）/ 启停 / 暂停 / 删除 | HTTP → FastAPI router → docker-py → Docker daemon → 返回模型化 JSON |
+| 容器 列表 / 创建（从镜像运行）/ 启停 / 暂停 / 删除（详情接口 `GET /api/containers/{cid}` 已实现，v1 界面未提供入口） | HTTP → FastAPI router → docker-py → Docker daemon → 返回模型化 JSON |
 | 拉取镜像 | HTTP POST /images/pull → docker-py `pull()`（异步/流进进出） |
 | 实时日志 | 前端 WS → `/ws/logs` → docker-py logs(stream=True) → 逐行前向 |
 | 交互终端 | 前端 xterm.js → `/ws/exec` → docker exec tty 双向 stdin/stdout |

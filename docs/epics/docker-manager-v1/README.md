@@ -82,6 +82,7 @@ RUN uv sync --frozen --no-install-project
 | Phase 4.6 审查发现（1 🔴 / 20 🟡） | **已修复（工作区未提交）** | 唯一 Critical「界面创建数据卷必然 422」已修并在**真实环境实测**（`POST /api/volumes` 对象体 `422 → 200`）。三路重审判定 **19/21 关闭**；rd2 判 PARTIAL 的 C-15（端点覆盖，66→124 passed）、C-17（下载预检加 30s 超时 + 取消）、C-22（本表同步）已在第二轮修复中关闭。完整清单与证据见 `test-review/code-review-report.md` §2。 |
 | 后端镜像重建（原 E-1） | **已解决** | 原问题：Docker 守护进程拉 `ghcr.io/astral-sh/uv:latest` 的 token 端点 TLS 握手超时 → `up -d --build` 后端部分失败，只能用 `docker cp` 临时把代码送进容器（容器与镜像不一致）。**修法（用户选 A）**：`backend/Dockerfile` 改为从 **PyPI** 安装 uv 并钉版本（`ARG UV_VERSION=0.12.0`，索引可用 `--build-arg PIP_INDEX_URL` 覆盖），彻底去掉 ghcr.io 依赖；`docs/deployment.md` / `docs/troubleshooting.md` 补上前置条件与覆盖方法。**验证**：重建成功、容器已从新镜像重建、容器内 `ws.py`/`security.py`/`main.py` 哈希与工作区源码**逐一 MATCH**，契约探测 10/10、真容器日志 4/4、真机 E2E 18/18 退出码 0。 |
 | 计划预审遗留 | 已知 | `plan.md` Task 11「打包三个独立视图」在预审时记 Fail（3/4）。**审查核实：`ImagesView.vue`/`NetworksView.vue`/`VolumesView.vue` 三个文件实际均已独立存在**（commit `7cfa52c`），本表此前对 Fail 原因的描述与事实不符。 |
+| 容器「详情」：接口有、界面无入口 | **已核实并回改文档（本轮）** | **实现事实**：后端 `GET /api/containers/{cid}` 确实存在（`backend/app/routers/containers.py:8` 路由前缀 `/api/containers` + `:154-159` 的 handler），但**前端零调用**——`frontend/src/api/index.ts:71-82` 的 `containersApi` **没有暴露任何 detail 方法**，界面上能按容器打开的只有日志 / 终端 / 文件拷贝三个抽屉 + 「打包为镜像」对话框。**文档缺口**：`scope.md:24`（F1 说明写作「列表/详情」）与 `spec.md:83`（§4 数据流写作「容器 列表/详情」）把详情并进了 v1 交付范围，与本实现不符。**处理**：两处历史设计文档只做**最小澄清**（改为「详情接口已实现，v1 界面未提供入口」），未重写；`docs/usage.md` §6.3 照实写明「面板里没有容器详情页/详情抽屉」。**旁证**：截图集缺 `02-container-detail.png`（其余 9 张齐全），因为没有可拍的详情界面。 |
 
 ## 设计会审记录（原始 append 日志）
 

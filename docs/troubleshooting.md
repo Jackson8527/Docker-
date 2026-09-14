@@ -64,7 +64,11 @@ proxy_buffering       off;
 
 同上，属于长连接。另外确认后端用的是流式响应——导出**不在服务器落盘**，所以几十 GB 的镜像也能导。
 
-如果前端仍然中断，检查 `frontend/src/api/index.ts` 里导出用的是不是 `NO_TIMEOUT`（`{ timeout: 0 }`）。axios 默认 30 秒超时会先于后端断开。
+如果前端仍然中断，**不要去查 axios 超时**——导出完全不经过 axios。真实链路是：`imagesApi.saveUrl()` 只拼出下载地址（`frontend/src/api/index.ts:89`）→ `startDownload()` 先做一次 **30 秒** 的 `fetch` 预检（`frontend/src/utils/download.ts:12` 定义 `PREFLIGHT_TIMEOUT = 30000`，`:50-86` 是预检本体：超时或非 2xx 就取消并弹出中文原因）→ 预检通过后把真正的传输交给裸 `<a href>`，由浏览器自己的下载管理器完成（`utils/download.ts:96-103`）。
+
+所以要查的是这两处：**预检是否报错**（报错会直接写明原因，例如「预检超过 30 秒仍未收到响应，已取消本次下载」），以及**前置代理 / 浏览器**是否掐断了那条长连接。
+
+> 预检只读响应状态行，**不是完整性校验**：守护进程在返回 200 **之后**才失败（打包大层时 I/O 错误、磁盘满）时，浏览器仍会拿到一个被截断的 tar，而界面已经提示「已开始导出」（`utils/download.ts:36-45`）。
 
 ---
 
