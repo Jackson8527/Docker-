@@ -37,6 +37,9 @@ _tmp_*
 # pytest
 .pytest_cache/
 pytest-cache-files-*
+# Staging dir used by tests/test_files_api.py when %TEMP% is not writable
+# (locked-down environments); always cleaned up, ignored as a backstop.
+backend/tests/_staging/
 
 # Browser automation tooling / UI verification output
 .browser-tools/

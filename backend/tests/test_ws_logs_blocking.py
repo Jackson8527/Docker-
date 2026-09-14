@@ -69,7 +69,10 @@ class _Containers:
     def __init__(self, cont):
         self._cont = cont
 
-    def list(self):
+    def list(self, all=False):
+        # `all` is part of docker-py's real signature; a mock that omits it is
+        # not a faithful stand-in (the app now asks for all=False, then
+        # all=True, so stopped containers can be streamed too).
         return [self._cont]
 
 
