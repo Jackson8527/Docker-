@@ -194,11 +194,19 @@ async function exportImage(row: ImageRow) {
 async function removeRow(row: ImageRow) {
   const label = row.tags?.[0] || shortId(row.id)
   try {
-    await ElMessageBox.confirm(`确认删除镜像「${label}」？`, '删除确认', {
-      type: 'warning',
-      confirmButtonText: '删除',
-      cancelButtonText: '取消',
-    })
+    // Forced removal is the only path this button has (`docker rmi -f`), and
+    // the UI has no switch for the soft variant - so the prompt spells out
+    // what force actually does instead of asking a bare 「确认删除？」.
+    await ElMessageBox.confirm(
+      `确认删除镜像「${label}」？将强制删除（等价 docker rmi -f）：` +
+        '即使镜像仍被容器引用也会被删除，之后无法再用它创建容器。',
+      '删除确认',
+      {
+        type: 'warning',
+        confirmButtonText: '删除',
+        cancelButtonText: '取消',
+      }
+    )
     await imagesApi.remove(row.id, true)
     ElMessage.success('已删除')
     load()

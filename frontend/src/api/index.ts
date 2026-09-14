@@ -57,7 +57,9 @@ const NO_TIMEOUT = { timeout: 0 }
 // `create` and `commit` are long by nature too, but not unbounded: a stuck
 // daemon would otherwise leave the UI spinning forever. 300s is a safety net
 // well above the real budget - scripts/e2e_verify.py allows 180s for
-// POST /api/containers (a missing image is pulled first) and 120s for
+// POST /api/containers (creating from an image that is already local: a
+// missing one is answered with 404 and never pulled - see
+// backend/app/routers/containers.py) and 120s for
 // GET /api/images/{id}/save (the streaming export, which this app downloads
 // through a bare <a href> and therefore does not time out at all). `commit`
 // itself still runs on the script's default 30s there, so its 300s here is a

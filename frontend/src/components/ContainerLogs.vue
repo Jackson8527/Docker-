@@ -8,7 +8,11 @@
           <el-option label="全部" value="both" />
         </el-select>
         <el-select v-model="tail" size="small" style="width: 104px" @change="reconnect">
+          <!-- 200 is what the view opens with (see `tail` in the script): every
+               option below the current value would be gone for good otherwise,
+               because the select can only offer what it lists. -->
           <el-option label="最近 100 行" :value="100" />
+          <el-option label="最近 200 行" :value="200" />
           <el-option label="最近 500 行" :value="500" />
           <el-option label="最近 2000 行" :value="2000" />
         </el-select>
@@ -78,6 +82,10 @@ interface Notice {
 
 const lines = ref<string[]>([])
 const stream = ref('stdout')
+// 200 lines is deliberate: the drawer has to paint something on the first
+// click, and the tail is replayed by the backend before anything is streamed.
+// It used to be a value the select did not list, so the control rendered a
+// bare `200` and any other choice made it unreachable - hence the option above.
 const tail = ref(200)
 const paused = ref(false)
 const status = ref<'connecting' | 'connected' | 'closed'>('connecting')

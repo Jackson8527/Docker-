@@ -60,7 +60,12 @@
           </template>
         </el-table-column>
 
-        <el-table-column label="操作" width="326" align="right" fixed="right">
+        <!-- The five buttons need 244px; with the 24px cell padding 326 left
+             58px of dead space that pushed the six columns past the panel at
+             1440 (1204 needed vs 1178 available) and made the fixed column
+             slide over 创建时间. 284 keeps a small slack and lets the table fit
+             at 1440; below that the fixed column behaves as before. -->
+        <el-table-column label="操作" width="284" align="right" fixed="right">
           <template #default="{ row }">
             <div class="dm-row-actions">
               <el-button
@@ -84,7 +89,11 @@
 
               <!-- Pause is only meaningful while running, and unpause only
                    while paused; Docker rejects both other combinations, so the
-                   two states share one slot instead of two dead buttons. -->
+                   two states share one slot instead of two dead buttons.
+                   Every other state (restarting / removing / created / dead /
+                   exited) still gets a disabled placeholder: rendering nothing
+                   there made the slot - and the whole feature - look missing,
+                   and the row snapped back to a narrower cell. -->
               <el-button
                 v-if="row.state === 'running'"
                 size="small"
@@ -106,6 +115,9 @@
                 @click="act('unpause', row)"
               >
                 恢复
+              </el-button>
+              <el-button v-else size="small" type="info" plain disabled :title="pauseHint(row)">
+                暂停
               </el-button>
 
               <el-button size="small" plain :disabled="isBusy(row)" @click="act('restart', row)">
@@ -225,6 +237,7 @@ import {
   Plus,
 } from '@element-plus/icons-vue'
 import { containersApi, type ContainerRow } from '../api'
+import { showApiError } from '../utils/error'
 import ContainerLogs from '../components/ContainerLogs.vue'
 import ContainerTerminal from '../components/ContainerTerminal.vue'
 import FileCopyDrawer from '../components/FileCopyDrawer.vue'
@@ -269,8 +282,7 @@ function fmtTime(iso: string) {
 }
 
 function fail(err: unknown) {
-  const e = err as { response?: { data?: { detail?: string } } }
-  ElMessage.error(e.response?.data?.detail || String(err))
+  showApiError(err)
 }
 
 async function load() {
@@ -315,6 +327,19 @@ function isBusy(row: ContainerRow): boolean {
 /** Drives the spinner on the one button that was actually clicked. */
 function isActing(row: ContainerRow, type: ContainerAction): boolean {
   return busy.value === `${row.id}:${type}`
+}
+
+/**
+ * Tooltip for the disabled pause slot shown outside running/paused.
+ *
+ * `restarting` / `removing` are transient: the daemon would reject the call
+ * until it settles, which is a different reason from a container that simply
+ * has no process to freeze.
+ */
+function pauseHint(row: ContainerRow): string {
+  return row.state === 'restarting' || row.state === 'removing'
+    ? '容器正在过渡中，请稍候'
+    : '容器未运行，无法暂停'
 }
 
 async function act(type: ContainerAction, row: ContainerRow) {
@@ -385,11 +410,19 @@ async function doCommit() {
 
 async function removeRow(row: ContainerRow) {
   try {
-    await ElMessageBox.confirm(`确认删除容器「${row.name}」？此操作不可撤销。`, '删除确认', {
-      type: 'warning',
-      confirmButtonText: '删除',
-      cancelButtonText: '取消',
-    })
+    // The call below always runs with force=true - i.e. `docker rm -f` - so the
+    // prompt has to say so. A bare 「确认删除？」 reads as the safe variant, and
+    // the user has no other switch in the UI that could tell them otherwise.
+    await ElMessageBox.confirm(
+      `确认删除容器「${row.name}」？将强制删除（等价 docker rm -f）：` +
+        '运行中的容器会被立即杀死，未写入数据卷的改动不可恢复。',
+      '删除确认',
+      {
+        type: 'warning',
+        confirmButtonText: '删除',
+        cancelButtonText: '取消',
+      }
+    )
     await containersApi.remove(row.id, true)
     ElMessage.success('已删除')
     load()

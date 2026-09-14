@@ -101,6 +101,7 @@ import { ref, reactive, computed, onMounted } from 'vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import { Search, Refresh, Plus, Delete } from '@element-plus/icons-vue'
 import { networksApi, type NetworkRow } from '../api'
+import { showApiError } from '../utils/error'
 
 const BUILTIN = ['bridge', 'host', 'none']
 
@@ -120,8 +121,7 @@ const filtered = computed(() => {
 const isBuiltin = (name: string) => BUILTIN.includes(name)
 
 function fail(err: unknown) {
-  const e = err as { response?: { data?: { detail?: string } } }
-  ElMessage.error(e.response?.data?.detail || String(err))
+  showApiError(err)
 }
 
 async function load() {

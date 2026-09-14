@@ -42,7 +42,11 @@
           </template>
         </el-table-column>
 
-        <el-table-column label="操作" width="150" align="right" fixed="right">
+        <!-- 150 was too narrow for 复制路径 + 删除 (156px of buttons plus the
+             24px cell padding): the buttons spilled past the cell, and since
+             `.dm-panel` is `overflow: hidden`, the 删除 button was cut off by
+             the panel's right edge. 188 leaves the two buttons a little slack. -->
+        <el-table-column label="操作" width="188" align="right" fixed="right">
           <template #default="{ row }">
             <div class="dm-row-actions">
               <el-button size="small" plain :icon="CopyDocument" @click="copyPath(row.mountpoint)">
@@ -80,6 +84,7 @@ import { ref, computed, onMounted } from 'vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import { Search, Refresh, Plus, Delete, CopyDocument } from '@element-plus/icons-vue'
 import { volumesApi, type VolumeRow } from '../api'
+import { showApiError } from '../utils/error'
 
 const rows = ref<VolumeRow[]>([])
 const loading = ref(false)
@@ -95,8 +100,7 @@ const filtered = computed(() => {
 })
 
 function fail(err: unknown) {
-  const e = err as { response?: { data?: { detail?: string } } }
-  ElMessage.error(e.response?.data?.detail || String(err))
+  showApiError(err)
 }
 
 async function load() {

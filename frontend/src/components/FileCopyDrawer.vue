@@ -69,6 +69,7 @@ import { UploadFilled, Download } from '@element-plus/icons-vue'
 import type { UploadFile, UploadFiles } from 'element-plus'
 import axios from 'axios'
 import { startDownload } from '../utils/download'
+import { showApiError } from '../utils/error'
 
 const props = defineProps<{ cid: string }>()
 
@@ -103,8 +104,7 @@ async function upload() {
     file.value = null
     fileList.value = []
   } catch (err: unknown) {
-    const e = err as { response?: { data?: { detail?: string } } }
-    ElMessage.error(e.response?.data?.detail || String(err))
+    showApiError(err, '拷入失败')
   } finally {
     uploading.value = false
   }
